@@ -17,35 +17,50 @@ app.get("/", (req, res) => {
 app.get("/oauth/start", (req, res) => {
   const clientId = process.env.HUBSPOT_CLIENT_ID;
   const redirectUri = process.env.HUBSPOT_REDIRECT_URI;
-  const url = `https://mcp-na2.hubspot.com/oauth/authorize/user?client_id=${clientId}&redirect_uri=${redirectUri}`;
+  const appId = process.env.HUBSPOT_APP_ID;
+
+  const url = `https://mcp-na2.hubspot.com/oauth/${appId}/authorize/user?client_id=${clientId}&redirect_uri=${redirectUri}&scope=crm.objects.contacts.write%20crm.objects.deals.write`;
+
   res.redirect(url);
 });
 
+
 // 2️⃣ OAuth callback
 app.get("/oauth/callback", async (req, res) => {
-  const code = req.query.code;
-  const clientId = process.env.HUBSPOT_CLIENT_ID;
-  const clientSecret = process.env.HUBSPOT_CLIENT_SECRET;
-  const redirectUri = process.env.HUBSPOT_REDIRECT_URI;
+  try {
+    const code = req.query.code;
+    const clientId = process.env.HUBSPOT_CLIENT_ID;
+    const clientSecret = process.env.HUBSPOT_CLIENT_SECRET;
+    const redirectUri = process.env.HUBSPOT_REDIRECT_URI;
 
-  // Exchange code for access token
-  const tokenResponse = await fetch("https://api.hubapi.com/oauth/v1/token", {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      grant_type: "authorization_code",
-      client_id: clientId,
-      client_secret: clientSecret,
-      redirect_uri: redirectUri,
-      code: code
-    })
-  });
+    const tokenResponse = await fetch("https://api.hubapi.com/oauth/v1/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        client_id: clientId,
+        client_secret: clientSecret,
+        redirect_uri: redirectUri,
+        code: code
+      })
+    });
 
-  const tokenData = await tokenResponse.json();
-  HUBSPOT_ACCESS_TOKEN = tokenData.access_token;
+    const tokenData = await tokenResponse.json();
 
-  res.send("HubSpot authorized! You can now send checkout data.");
+    if (tokenData.error) {
+      console.error("HubSpot OAuth error:", tokenData);
+      return res.status(400).send("HubSpot OAuth failed");
+    }
+
+    HUBSPOT_ACCESS_TOKEN = tokenData.access_token;
+
+    res.send("HubSpot authorized! You can now send checkout data.");
+  } catch (err) {
+    console.error(err);
+    res.status(500).send("Server error during OAuth");
+  }
 });
+
 
 // 3️⃣ Shopify webhook endpoint
 app.post("/checkout-completed", async (req, res) => {
