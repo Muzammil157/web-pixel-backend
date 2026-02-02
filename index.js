@@ -19,7 +19,7 @@ app.get("/oauth/start", (req, res) => {
   const redirectUri = process.env.HUBSPOT_REDIRECT_URI;
   const appId = process.env.HUBSPOT_APP_ID;
 
-  const url = `https://mcp-na2.hubspot.com/oauth/${appId}/authorize/user?client_id=${clientId}&redirect_uri=${redirectUri}&scope=crm.objects.contacts.write%20crm.objects.deals.write`;
+  const url = `https://mcp-na2.hubspot.com/oauth/${appId}/authorize/user?client_id=${clientId}&redirect_uri=${redirectUri}`;
 
   res.redirect(url);
 });
