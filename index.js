@@ -16,13 +16,18 @@ app.get("/", (req, res) => {
 // 1️⃣ Start OAuth flow
 app.get("/oauth/start", (req, res) => {
   const clientId = process.env.HUBSPOT_CLIENT_ID;
-  const redirectUri = process.env.HUBSPOT_REDIRECT_URI;
+  const redirectUri = encodeURIComponent(process.env.HUBSPOT_REDIRECT_URI);
   const appId = process.env.HUBSPOT_APP_ID;
 
-  const url = `https://mcp-na2.hubspot.com/oauth/${appId}/authorize/user?client_id=${clientId}&redirect_uri=${redirectUri}`;
+  const scopes = encodeURIComponent(
+    "crm.objects.contacts.write crm.objects.deals.write crm.objects.orders.write"
+  );
+
+  const url = `https://mcp-na2.hubspot.com/oauth/${appId}/authorize/user?client_id=${clientId}&redirect_uri=${redirectUri}&scope=${scopes}`;
 
   res.redirect(url);
 });
+
 
 
 // 2️⃣ OAuth callback
@@ -53,6 +58,9 @@ app.get("/oauth/callback", async (req, res) => {
     }
 
     HUBSPOT_ACCESS_TOKEN = tokenData.access_token;
+    const HUBSPOT_REFRESH_TOKEN = tokenData.refresh_token;
+    console.log("Access token:", HUBSPOT_ACCESS_TOKEN);
+console.log("Refresh token:", HUBSPOT_REFRESH_TOKEN);
 
     res.send("HubSpot authorized! You can now send checkout data.");
   } catch (err) {
@@ -70,41 +78,47 @@ app.post("/checkout-completed", async (req, res) => {
     return res.status(400).json({ error: "HubSpot not authorized yet" });
   }
 
-  // Send contact data
-  await fetch("https://api.hubapi.com/crm/v3/objects/contacts", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${HUBSPOT_ACCESS_TOKEN}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      properties: {
-        email: checkout.email,
-        firstname: checkout.billingAddress.firstName,
-        lastname: checkout.billingAddress.lastName,
+  try {
+    // Send contact data
+    await fetch("https://api.hubapi.com/crm/v3/objects/contacts", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${HUBSPOT_ACCESS_TOKEN}`,
+        "Content-Type": "application/json",
       },
-    }),
-  });
+      body: JSON.stringify({
+        properties: {
+          email: checkout.email,
+          firstname: checkout.billingAddress?.firstName || "",
+          lastname: checkout.billingAddress?.lastName || "",
+        },
+      }),
+    });
 
-  // Send order data
-  await fetch("https://api.hubapi.com/crm/v3/objects/orders", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${HUBSPOT_ACCESS_TOKEN}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      properties: {
-        hs_order_id: checkout.order_id,
-        amount: checkout.total,
-        currency: checkout.currency,
-        email: checkout.email,
+    // Send order data
+    await fetch("https://api.hubapi.com/crm/v3/objects/orders", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${HUBSPOT_ACCESS_TOKEN}`,
+        "Content-Type": "application/json",
       },
-    }),
-  });
+      body: JSON.stringify({
+        properties: {
+          hs_order_id: checkout.order_id,
+          amount: checkout.total,
+          currency: checkout.currency,
+          email: checkout.email,
+        },
+      }),
+    });
 
-  res.status(200).json({ success: true });
+    res.status(200).json({ success: true });
+  } catch (err) {
+    console.error("Error sending to HubSpot:", err);
+    res.status(500).json({ error: "Failed to send data to HubSpot" });
+  }
 });
+
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
