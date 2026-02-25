@@ -116,9 +116,7 @@ app.post("/checkout-completed", async (req, res) => {
   {
     properties: {
       hs_order_name: checkout.order_id,
-      hs_currency_code: checkout.currency,        // HubSpot prefers hs_currency
-      hs_total_amount: checkout.total,       // safer than custom "amount"
-      email: checkout.email,
+      hs_currency_code: checkout.currency,
     },
   },
   {
