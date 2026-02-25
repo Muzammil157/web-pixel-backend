@@ -99,8 +99,8 @@ app.post("/checkout-completed", async (req, res) => {
   {
     properties: {
       email: checkout.email,
-      firstname: checkout.billingAddress?.firstName || "",
-      lastname: checkout.billingAddress?.lastName || "",
+      firstname: checkout.first_name || "",
+      lastname: checkout.last_name || "",
     },
   },
   {
