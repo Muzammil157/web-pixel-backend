@@ -115,8 +115,8 @@ app.post("/checkout-completed", async (req, res) => {
   "https://api.hubapi.com/crm/v3/objects/orders",
   {
     properties: {
-      hs_order_id: checkout.order_id,
-      hs_currency: checkout.currency,        // HubSpot prefers hs_currency
+      hs_order_name: checkout.order.id,
+      hs_currency_code: checkout.currency,        // HubSpot prefers hs_currency
       hs_total_amount: checkout.total,       // safer than custom "amount"
       email: checkout.email,
     },
