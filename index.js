@@ -94,7 +94,7 @@ app.post("/checkout-completed", async (req, res) => {
 
   try {
     // Send contact data
-    await axios.post(
+  const contactResponse = await axios.post(
   "https://api.hubapi.com/crm/v3/objects/contacts",
   {
     properties: {
@@ -121,6 +121,17 @@ app.post("/checkout-completed", async (req, res) => {
       hs_shipping_address_state: checkout.address_state,
       hs_shipping_address_street: checkout.address_street,
     },
+    associations: [
+        {
+          to: { id: contactResponse.data.id }, // HubSpot Order ID
+          types: [
+            {
+              associationCategory: "HUBSPOT_DEFINED",
+              associationTypeId: 507
+            }
+          ]
+        }
+      ]
   },
   {
     headers: {
