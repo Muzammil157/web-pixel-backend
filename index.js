@@ -111,12 +111,16 @@ app.post("/checkout-completed", async (req, res) => {
 );
 
     // Send order data
-   await axios.post(
+   const orderResponse = await axios.post(
   "https://api.hubapi.com/crm/v3/objects/orders",
   {
     properties: {
-      hs_order_name: checkout.order_id,
-      hs_currency_code: checkout.currency,
+      hs_order_name: checkout.order?.id,
+      hs_currency_code: checkout.totalPrice?.currencyCode,
+      hs_total: checkout.totalPrice?.amount,
+      email: checkout.email,
+      firstname: checkout.billingAddress?.firstName,
+      lastname: checkout.billingAddress?.lastName,
     },
   },
   {
@@ -126,6 +130,27 @@ app.post("/checkout-completed", async (req, res) => {
     },
   }
 );
+
+for (let item of checkout.lineItems) {
+  await axios.post(
+    "https://api.hubapi.com/crm/v3/objects/line_items",
+    {
+      properties: {
+        name: item.title,
+        quantity: item.quantity,
+        price: item.price?.amount,
+        hs_sku: item.variant?.sku,
+        associatedorderid: orderResponse.data.id, // associate with the order
+      },
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${HUBSPOT_ACCESS_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+    }
+  );
+}
 
     res.status(200).json({ success: true });
   } catch (err) {
