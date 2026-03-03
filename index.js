@@ -115,12 +115,11 @@ app.post("/checkout-completed", async (req, res) => {
   "https://api.hubapi.com/crm/v3/objects/orders",
   {
     properties: {
-      hs_order_name: checkout.order?.id,
-      hs_currency_code: checkout.totalPrice?.currencyCode,
-      hs_total: checkout.totalPrice?.amount,
-      email: checkout.email,
-      firstname: checkout.billingAddress?.firstName,
-      lastname: checkout.billingAddress?.lastName,
+      hs_order_name: checkout.order_id,
+      hs_currency_code: checkout.currency,
+      hs_shipping_address_city: checkout.billing_city,
+      hs_shipping_address_state: checkout.address_state,
+      hs_shipping_address_street: checkout.address_street,
     },
   },
   {
@@ -131,17 +130,27 @@ app.post("/checkout-completed", async (req, res) => {
   }
 );
 
-for (let item of checkout.lineItems) {
+for (let item of checkout.line_items) {
   await axios.post(
     "https://api.hubapi.com/crm/v3/objects/line_items",
     {
       properties: {
         name: item.title,
         quantity: item.quantity,
-        price: item.price?.amount,
-        hs_sku: item.variant?.sku,
-        associatedorderid: orderResponse.data.id, // associate with the order
+        price: item.price,
+        hs_sku: item.sku,
       },
+      associations: [
+        {
+          to: { id: orderResponse.data.id }, // HubSpot Order ID
+          types: [
+            {
+              associationCategory: "HUBSPOT_DEFINED",
+              associationTypeId: 514
+            }
+          ]
+        }
+      ]
     },
     {
       headers: {
