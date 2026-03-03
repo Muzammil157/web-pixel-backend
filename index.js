@@ -120,6 +120,7 @@ app.post("/checkout-completed", async (req, res) => {
       hs_shipping_address_city: checkout.billing_city,
       hs_shipping_address_state: checkout.address_state,
       hs_shipping_address_street: checkout.address_street,
+      hs_total_price: checkout.total,
     },
     associations: [
         {
