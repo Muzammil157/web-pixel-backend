@@ -90,10 +90,10 @@ app.post("/connect-pixel", async (req, res) => {
 
     const response = await axios.post(
       `https://${shop}/admin/api/2026-01/graphql.json`,
-      {
+            {
         query: `
-          mutation {
-            webPixelCreate(webPixel: { settings: "{\"name\":\"Test Pixel\"}" }) {
+          mutation webPixelCreate($settings: JSON!) {
+            webPixelCreate(webPixel: { settings: $settings }) {
               userErrors {
                 code
                 field
@@ -105,7 +105,12 @@ app.post("/connect-pixel", async (req, res) => {
               }
             }
           }
-        `
+        `,
+        variables: {
+          settings: {
+            name: "Test Pixel"
+          }
+        }
       },
       {
         headers: {
