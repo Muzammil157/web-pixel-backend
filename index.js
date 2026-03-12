@@ -132,7 +132,100 @@ app.post("/connect-pixel", async (req, res) => {
 
 
 
-// 3️⃣ Shopify webhook endpoint
+// // 3️⃣ Shopify webhook endpoint
+// app.post("/checkout-completed", async (req, res) => {
+//   const checkout = req.body;
+
+//   if (!HUBSPOT_ACCESS_TOKEN) {
+//     return res.status(400).json({ error: "HubSpot not authorized yet" });
+//   }
+
+//   try {
+//     // Send contact data
+//   const contactResponse = await axios.post(
+//   "https://api.hubapi.com/crm/v3/objects/contacts",
+//   {
+//     properties: {
+//       email: checkout.email,
+//       firstname: checkout.first_name || "",
+//       lastname: checkout.last_name || "",
+//     },
+//   },
+//   {
+//     headers: {
+//       Authorization: `Bearer ${HUBSPOT_ACCESS_TOKEN}`,
+//     },
+//   }
+// );
+
+//     // Send order data
+//    const orderResponse = await axios.post(
+//   "https://api.hubapi.com/crm/v3/objects/orders",
+//   {
+//     properties: {
+//       hs_order_name: "Shopify order",
+//       hs_total_price: checkout.total,
+//     },
+//     associations: [
+//         {
+//           to: { id: contactResponse.data.id }, // HubSpot Order ID
+//           types: [
+//             {
+//               associationCategory: "HUBSPOT_DEFINED",
+//               associationTypeId: 507
+//             }
+//           ]
+//         }
+//       ]
+//   },
+//   {
+//     headers: {
+//       Authorization: `Bearer ${HUBSPOT_ACCESS_TOKEN}`,
+//       "Content-Type": "application/json",
+//     },
+//   }
+// );
+
+// for (let item of checkout.line_items) {
+//   await axios.post(
+//     "https://api.hubapi.com/crm/v3/objects/line_items",
+//     {
+//       properties: {
+//         name: item.title,
+//         quantity: item.quantity,
+//         price: item.price,
+//         hs_sku: item.sku,
+//       },
+//       associations: [
+//         {
+//           to: { id: orderResponse.data.id }, // HubSpot Order ID
+//           types: [
+//             {
+//               associationCategory: "HUBSPOT_DEFINED",
+//               associationTypeId: 514
+//             }
+//           ]
+//         }
+//       ]
+//     },
+//     {
+//       headers: {
+//         Authorization: `Bearer ${HUBSPOT_ACCESS_TOKEN}`,
+//         "Content-Type": "application/json",
+//       },
+//     }
+//   );
+// }
+
+//     res.status(200).json({ success: true });
+//   } catch (err) {
+//     console.error("Error sending to HubSpot:", err);
+//     res.status(500).json({ error: "Failed to send data to HubSpot" });
+//   }
+// });
+
+
+// Shopify webhook endpoint for contact creation
 app.post("/checkout-completed", async (req, res) => {
   const checkout = req.body;
 
@@ -141,89 +234,63 @@ app.post("/checkout-completed", async (req, res) => {
   }
 
   try {
-    // Send contact data
-  const contactResponse = await axios.post(
-  "https://api.hubapi.com/crm/v3/objects/contacts",
-  {
-    properties: {
-      email: checkout.email,
-      firstname: checkout.first_name || "",
-      lastname: checkout.last_name || "",
-    },
-  },
-  {
-    headers: {
-      Authorization: `Bearer ${HUBSPOT_ACCESS_TOKEN}`,
-    },
-  }
-);
+    const email = checkout.email;
 
-    // Send order data
-   const orderResponse = await axios.post(
-  "https://api.hubapi.com/crm/v3/objects/orders",
-  {
-    properties: {
-      hs_order_name: "Shopify order",
-      hs_total_price: checkout.total,
-    },
-    associations: [
-        {
-          to: { id: contactResponse.data.id }, // HubSpot Order ID
-          types: [
-            {
-              associationCategory: "HUBSPOT_DEFINED",
-              associationTypeId: 507
-            }
-          ]
-        }
-      ]
-  },
-  {
-    headers: {
-      Authorization: `Bearer ${HUBSPOT_ACCESS_TOKEN}`,
-      "Content-Type": "application/json",
-    },
-  }
-);
+    // 1️⃣ Check if contact already exists
+    const searchResponse = await axios.post(
+      "https://api.hubapi.com/crm/v3/objects/contacts/search",
+      {
+        filterGroups: [
+          {
+            filters: [
+              {
+                propertyName: "email",
+                operator: "EQ",
+                value: email,
+              },
+            ],
+          },
+        ],
+        properties: ["email"],
+        limit: 1,
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${HUBSPOT_ACCESS_TOKEN}`,
+          "Content-Type": "application/json",
+        },
+      }
+    );
 
-for (let item of checkout.line_items) {
-  await axios.post(
-    "https://api.hubapi.com/crm/v3/objects/line_items",
-    {
-      properties: {
-        name: item.title,
-        quantity: item.quantity,
-        price: item.price,
-        hs_sku: item.sku,
-      },
-      associations: [
+    if (searchResponse.data.results.length === 0) {
+      // 2️⃣ Contact does not exist, create it
+      const contactResponse = await axios.post(
+        "https://api.hubapi.com/crm/v3/objects/contacts",
         {
-          to: { id: orderResponse.data.id }, // HubSpot Order ID
-          types: [
-            {
-              associationCategory: "HUBSPOT_DEFINED",
-              associationTypeId: 514
-            }
-          ]
+          properties: {
+            email: email,
+            firstname: checkout.first_name || "",
+            lastname: checkout.last_name || "",
+          },
+        },
+        {
+          headers: {
+            Authorization: `Bearer ${HUBSPOT_ACCESS_TOKEN}`,
+            "Content-Type": "application/json",
+          },
         }
-      ]
-    },
-    {
-      headers: {
-        Authorization: `Bearer ${HUBSPOT_ACCESS_TOKEN}`,
-        "Content-Type": "application/json",
-      },
+      );
+      console.log("Contact created:", contactResponse.data.id);
+    } else {
+      console.log("Contact already exists. Doing nothing.");
     }
-  );
-}
 
     res.status(200).json({ success: true });
   } catch (err) {
-    console.error("Error sending to HubSpot:", err);
+    console.error("Error sending to HubSpot:", err.response?.data || err.message);
     res.status(500).json({ error: "Failed to send data to HubSpot" });
   }
 });
-
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
