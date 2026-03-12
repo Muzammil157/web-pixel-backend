@@ -235,6 +235,10 @@ app.post("/checkout-completed", async (req, res) => {
 
   try {
     const email = checkout.email;
+    if (!email || email.trim() === "") {
+      console.log("Skipping HubSpot contact creation because email is empty");
+      return;
+    }
 
     // 1️⃣ Check if contact already exists
     const searchResponse = await axios.post(
