@@ -4,7 +4,6 @@ const express = require("express");
 const fetch = require("node-fetch");
 const axios = require("axios");
 const bodyParser = require("body-parser");
-const crypto = require("crypto")
 
 const app = express();
 app.use(cors({
@@ -16,55 +15,12 @@ app.use(cors({
 app.use(express.json());
 
 const HUBSPOT_ACCESS_TOKEN = process.env.HUBSPOT_ACCESS_TOKEN;
+const SHOPIFY_ACCESS_TOKEN = process.env.SHOPIFY_ACCESS_TOKEN;
 
 
 // Root route (optional)
 app.get("/", (req, res) => {
   res.send("Backend is running!");
-});
-
-const CLIENT_ID = "388a0e6652106e31fd681110b0069668"; 
-const CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET;
-const REDIRECT_URI = "https://web-pixel-backend-3c6p.onrender.com/oauth/callback";
-
-// Step 1: Generate install link for merchant
-app.get("/install", (req, res) => {
-  const shop = req.query.shop; // e.g. medical-and-lab-supplies.myshopify.com
-  if (!shop) return res.status(400).send("Missing shop query param");
-
-  const state = crypto.randomBytes(16).toString("hex"); // CSRF token
-  const scopes = "read_customer_events,read_customers,read_orders,write_pixels";
-
-  const installUrl = `https://${shop}/admin/oauth/authorize?client_id=${CLIENT_ID}&scope=${scopes}&redirect_uri=${REDIRECT_URI}&state=${state}`;
-
-  res.redirect(installUrl);
-});
-
-app.get("/oauth/callback", async (req, res) => {
-  const { shop, code, state } = req.query;
-
-  if (!shop || !code) return res.status(400).send("Missing params");
-
-  try {
-    // Exchange code for Admin API token
-    const tokenResponse = await axios.post(`https://${shop}/admin/oauth/access_token`, {
-      client_id: CLIENT_ID,
-      client_secret: CLIENT_SECRET,
-      code: code
-    });
-
-    const accessToken = tokenResponse.data.access_token;
-    console.log("Got Admin API token:", accessToken);
-
-    // Save accessToken in DB or in memory for now
-    // Example: run webPixelCreate automatically
-    await createWebPixel(shop, accessToken);
-
-    res.send("App installed and pixel connected successfully!");
-  } catch (err) {
-    console.error(err.response?.data || err.message);
-    res.status(500).send("Failed to get access token");
-  }
 });
 
 // 1️⃣ Start OAuth flow
@@ -128,33 +84,47 @@ app.get("/oauth/callback", async (req, res) => {
 //   }
 // });
 
-const createWebPixel = async (shop, accessToken) => {
-  const query = `
-    mutation webPixelCreate($settings: JSON!) {
-      webPixelCreate(webPixel: { settings: $settings }) {
-        userErrors { message }
-        webPixel { id }
-      }
-    }
-  `;
-  const variables = {
-    settings: { name: "HubSpot Pixel" }
-  };
+app.post("/connect-pixel", async (req, res) => {
+  try {
+    const shop = "medical-and-lab-supplies.myshopify.com";
 
-  const response = await axios.post(
-    `https://${shop}/admin/api/2024-10/graphql.json`,
-    { query, variables },
-    {
-      headers: {
-        "X-Shopify-Access-Token": accessToken,
-        "Content-Type": "application/json"
+    const response = await axios.post(
+      `https://${shop}/admin/api/2026-01/graphql.json`,
+      {
+        query: `
+          mutation {
+            webPixelCreate(webPixel: { settings: "{\"name\":\"Test Pixel\"}" }) {
+              userErrors {
+                code
+                field
+                message
+              }
+              webPixel {
+                settings
+                id
+              }
+            }
+          }
+        `
+      },
+      {
+        headers: {
+          "X-Shopify-Access-Token": SHOPIFY_ACCESS_TOKEN,
+          "Content-Type": "application/json"
+        }
       }
-    }
+    );
+
+    res.json(response.data);
+  } catch (error) {
+  console.error(
+    "Shopify error:",
+    error.response?.data || error.message
   );
+  res.status(500).json(error.response?.data || { error: error.message });
+}
+});
 
-  console.log("Pixel created:", response.data);
-  return response.data;
-};
 
 
 // 3️⃣ Shopify webhook endpoint
