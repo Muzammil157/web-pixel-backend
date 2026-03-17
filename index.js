@@ -131,6 +131,50 @@ app.post("/connect-pixel", async (req, res) => {
 });
 
 
+app.post('/webhook/orders-create', async (req, res) => {
+  const order = req.body;
+
+  if (!order.customer) return res.sendStatus(200);
+
+  // Get customer from Shopify
+  const customerId = order.customer.id;
+
+  const customerRes = await fetch(
+    `https://medical-and-lab-supplies.myshopify.com/admin/api/2026-01/customers/${customerId}.json`,
+    {
+      headers: {
+        'X-Shopify-Access-Token': SHOPIFY_ACCESS_TOKEN
+      }
+    }
+  );
+
+  const customerData = await customerRes.json();
+  const tags = customerData.customer.tags;
+
+  if (tags.includes('B2B')) {
+    // Update order with PO number
+    await fetch(
+      `https://medical-and-lab-supplies.myshopify.com/admin/api/2026-01/orders/${order.id}.json`,
+      {
+        method: 'PUT',
+        headers: {
+          'X-Shopify-Access-Token': SHOPIFY_ACCESS_TOKEN,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          order: {
+            id: order.id,
+            po_number: "B2B_customer"
+          }
+        })
+      }
+    );
+  }
+
+  res.sendStatus(200);
+});
+
+
 
 // // 3️⃣ Shopify webhook endpoint
 // app.post("/checkout-completed", async (req, res) => {
