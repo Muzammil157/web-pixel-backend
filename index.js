@@ -130,48 +130,58 @@ app.post("/connect-pixel", async (req, res) => {
 }
 });
 
-
 app.post('/webhook/orders-create', async (req, res) => {
   const order = req.body;
 
-  if (!order.customer) return res.sendStatus(200);
+  // Always respond fast to Shopify
+  res.sendStatus(200);
 
-  // Get customer from Shopify
-  const customerId = order.customer.id;
+  try {
+    if (!order.customer) return;
 
-  const customerRes = await fetch(
-    `https://medical-and-lab-supplies.myshopify.com/admin/api/2026-01/customers/${customerId}.json`,
-    {
-      headers: {
-        'X-Shopify-Access-Token': SHOPIFY_ACCESS_TOKEN
-      }
-    }
-  );
+    const customerId = order.customer.id;
 
-  const customerData = await customerRes.json();
-  const tags = customerData.customer.tags;
-
-  if (tags.includes('B2B')) {
-    // Update order with PO number
-    await fetch(
-      `https://medical-and-lab-supplies.myshopify.com/admin/api/2026-01/orders/${order.id}.json`,
+    // 🔹 Get customer from Shopify
+    const customerRes = await axios.get(
+      `https://medical-and-lab-supplies.myshopify.com/admin/api/2026-01/customers/${customerId}.json`,
       {
-        method: 'PUT',
         headers: {
-          'X-Shopify-Access-Token': SHOPIFY_ACCESS_TOKEN,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
+          'X-Shopify-Access-Token': SHOPIFY_ACCESS_TOKEN
+        }
+      }
+    );
+
+    const tags = customerRes.data.customer.tags;
+
+    // 🔹 Check if B2B
+    if (tags && tags.includes('B2B')) {
+
+      // 🔹 Update order with PO number
+      await axios.put(
+        `https://medical-and-lab-supplies.myshopify.com/admin/api/2026-01/orders/${order.id}.json`,
+        {
           order: {
             id: order.id,
             po_number: "B2B_customer"
           }
-        })
-      }
+        },
+        {
+          headers: {
+            'X-Shopify-Access-Token': SHOPIFY_ACCESS_TOKEN,
+            'Content-Type': 'application/json'
+          }
+        }
+      );
+
+      console.log(`Order ${order.id} updated with B2B PO number`);
+    }
+
+  } catch (err) {
+    console.error(
+      'Error:',
+      err.response?.data || err.message
     );
   }
-
-  res.sendStatus(200);
 });
 
 
