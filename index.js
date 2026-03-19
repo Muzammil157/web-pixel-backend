@@ -205,7 +205,7 @@ app.post('/webhook/orders-create', async (req, res) => {
     const tags = customerRes.data.customer.tags;
 
     // 🔹 Check if B2B
-    if (tags && tags.includes('B2B')) {
+    if (tags && tags.includes('PROC_ACCT')) {
 
       // 🔹 Update order with PO number
       await axios.put(
@@ -213,7 +213,7 @@ app.post('/webhook/orders-create', async (req, res) => {
         {
           order: {
             id: order.id,
-            po_number: "B2B_customer"
+            po_number: "PROC_ACCT"
           }
         },
         {
