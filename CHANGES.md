@@ -2,6 +2,88 @@
 
 ---
 
+## [2026-04-16] HubSpot segmentation flags — shopify_has_order, shopify_is_abandoned, contact_attempted
+
+**Branch:** `hubspot-new`
+**File changed:** `index.js` only — 4 targeted edits
+
+---
+
+### Problem being fixed
+
+HubSpot `lifecyclestage` is unreliable as a segmentation signal — it can only move forward, gets out of sync, and doesn't distinguish between:
+- abandoned checkout vs completed purchase
+- contacted lead vs un-contacted lead
+- returning customer vs first-time buyer
+
+### Three new HubSpot contact properties
+
+> These properties must be created as **custom contact properties** in HubSpot before deployment.
+> Go to: HubSpot → Settings → Properties → Contact properties → Create property
+
+| Property | Type | Values | Set by |
+|---|---|---|---|
+| `shopify_has_order` | Checkbox / Boolean | `"true"` / `"false"` | `orders/create` only |
+| `shopify_is_abandoned` | Checkbox / Boolean | `"true"` / `"false"` | Checkout sets true; order sets false |
+| `contact_attempted` | Checkbox / Boolean | `"true"` / `"false"` | Marketing flows only; code sets false as default |
+| `last_contact_status` | Single-line text | `"attempted"` / `"emailed"` / `"replied"` | Marketing flows only (not set by this code) |
+
+### Flag logic per event
+
+#### Checkout pixel → `/checkout-completed`
+
+**Create (new contact):**
+```
+shopify_has_order   = "false"
+shopify_is_abandoned = "true"
+contact_attempted   = "false"   ← default, marketing will override
+```
+
+**Update (existing contact, not yet a customer):**
+```
+shopify_has_order   = "false"   ← only if shopify_has_order is not already "true"
+shopify_is_abandoned = "true"   ← only if shopify_has_order is not already "true"
+contact_attempted   = "false"   ← only if not already "true" (preserves marketing state)
+```
+
+**Guard:** if `shopify_has_order === "true"` (returning customer starting new checkout), flags are NOT changed. Purchase truth is never overwritten by the checkout flow.
+
+#### Order webhook → `reconcileOrderContact`
+
+```
+shopify_has_order   = "true"    ← ONLY place this is ever set to true
+shopify_is_abandoned = "false"  ← cancels the abandoned state
+lifecyclestage      = "customer"
+contact_attempted   → NOT TOUCHED (engagement state is independent)
+```
+
+### What was changed (4 edits)
+
+1. **`/checkout-completed` search** — added `shopify_has_order`, `shopify_is_abandoned`, `contact_attempted` to the `properties` array so we can read them before deciding what to write
+2. **`/checkout-completed` create block** — added 3 flags to new contact properties
+3. **`/checkout-completed` update block** — added 3 flags with guards (purchase truth protection + contact_attempted preservation)
+4. **`findHubSpotContactByEmail`** — added same 3 properties to the search so `reconcileOrderContact` can read them; added `shopify_has_order`, `shopify_is_abandoned` to `customerProps` in `reconcileOrderContact`
+
+### Contact classification after fix
+
+| `shopify_has_order` | `shopify_is_abandoned` | `contact_attempted` | Classification |
+|---|---|---|---|
+| `false` | `true` | `false` | Abandoned lead — never contacted |
+| `false` | `true` | `true` | Abandoned lead — follow-up attempted |
+| `true` | `false` | `false` | Customer — no follow-up needed |
+| `true` | `false` | `true` | Customer — was previously contacted |
+
+### What was NOT changed
+- `reconciliationMap` / `checkoutTokenMap` logic — untouched
+- `/connect-pixel` — untouched
+- B2B PO number logic — untouched
+- OAuth routes — untouched
+- PayPal logic — untouched
+
+---
+
+---
+
 ## [2026-04-16] Checkout-token bridge + resilient order reconciliation
 
 **Branch:** `hubspot-new`
