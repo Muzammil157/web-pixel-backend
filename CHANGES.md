@@ -1,5 +1,98 @@
 # Project Changelog — hubspot-new branch
 
+---
+
+## [2026-04-16] Checkout-token bridge + resilient order reconciliation
+
+**Branch:** `hubspot-new`
+**File changed:** `index.js` only — 4 targeted changes
+
+### Problem being fixed
+
+Email mismatch between checkout pixel and order webhook caused reconciliation to silently fail — users remained as "Guest" even after placing a real order because:
+- `order.email` can differ from the pixel-submitted email (guest changes email at payment step)
+- `order.email` can be absent entirely on some guest checkouts
+- The old reconciliation only searched by email — if it missed, it created a new duplicate contact
+
+### Changes made
+
+#### 1. `checkoutTokenMap` added alongside `reconciliationMap`
+
+```js
+const checkoutTokenMap = new Map(); // checkout_token → email
+```
+
+Secondary index that acts as the bridge between the checkout pixel event and the order webhook. Populated when a checkout is received; consumed when an order is reconciled.
+
+#### 2. `/checkout-completed` — store `checkout_token` in both maps
+
+Extracts `checkout.token` (Shopify pixel field) from the payload.
+
+- Added `checkout_token` field to `reconciliationMap` entry
+- Stores `checkoutTokenMap.set(token, email)` for order-side lookup
+
+#### 3. `/webhook/orders-create` — widen trigger condition
+
+Was: `if (order.email && HUBSPOT_ACCESS_TOKEN)`
+Now: `if (HUBSPOT_ACCESS_TOKEN && (order.email || order.checkout_token))`
+
+Orders with no email but a checkout_token now also go through reconciliation.
+
+#### 4. `reconcileOrderContact` — full 3-step matching + `findHubSpotContactByEmail` helper
+
+**Step A — email match (existing logic, now in a reusable helper)**
+Search HubSpot by `order.email`. Helper `findHubSpotContactByEmail` wraps the search call and returns `null` on failure (never throws).
+
+**Step B — checkout_token bridge (new)**
+If Step A finds nothing (or email is missing):
+- Read `order.checkout_token`
+- Look up `checkoutTokenMap` → get the pixel-submitted email
+- Search HubSpot by that email instead
+- Logs: `[HubSpot] Bridging order X via checkout_token → email@example.com`
+
+**Last resort — create as customer**
+If both steps miss: create a new contact using `resolvedEmail || order.billing_address.email`. Logs a warning and skips if no email can be resolved at all.
+
+**Strong merge (updated)**
+The PATCH now always sends real name data from the order (not conditional on "Guest"/"Shopify"):
+```js
+if (firstname) customerProps.firstname = firstname;
+if (lastname)  customerProps.lastname  = lastname;
+```
+Order identity always overwrites whatever was in HubSpot.
+
+### Matching flow after fix
+
+```
+Order received (orders/create)
+        │
+        ├── email present?
+        │     YES → Step A: search HubSpot by order.email
+        │               │
+        │               ├── Contact found → PATCH to CUSTOMER + real names
+        │               └── Not found → fall through to Step B
+        │
+        ├── checkout_token present?
+        │     YES → Step B: checkoutTokenMap[token] → pixel email
+        │               │
+        │               ├── Email found in map → search HubSpot by pixel email
+        │               │       ├── Contact found → PATCH to CUSTOMER + real names
+        │               │       └── Not found → Last resort
+        │               └── Token not in map → Last resort
+        │
+        └── Last resort
+              └── Create new CUSTOMER contact (or skip if no email at all)
+```
+
+### What was NOT changed
+- `/connect-pixel` — untouched
+- B2B PO number logic — untouched
+- All commented-out OAuth routes — untouched
+- `/checkout-completed` internal HubSpot create/update logic — untouched
+- Any other route — untouched
+
+---
+
 All changes documented in reverse chronological order.
 This file is updated after every code change.
 

@@ -17,12 +17,16 @@ app.use(express.json());
 const HUBSPOT_ACCESS_TOKEN = process.env.HUBSPOT_ACCESS_TOKEN;
 const SHOPIFY_ACCESS_TOKEN = process.env.SHOPIFY_ACCESS_TOKEN;
 
-// ── Reconciliation Map ─────────────────────────────────────────────────────
-// Lightweight in-memory store tracking each email's lifecycle state.
-// Resets on server restart — HubSpot is the persistent source of truth.
-// Key: email (string)
-// Value: { status: 'LEAD'|'CUSTOMER', firstname, lastname, timestamp }
+// ── Reconciliation Maps ────────────────────────────────────────────────────
+// Both reset on server restart — HubSpot is the persistent source of truth.
+
+// Primary: email → { status, checkout_token, firstname, lastname, timestamp }
 const reconciliationMap = new Map();
+
+// Secondary index: checkout_token → email
+// Bridges the gap when order.email differs from checkout pixel email.
+// Populated by /checkout-completed, consumed by reconcileOrderContact.
+const checkoutTokenMap = new Map();
 
 
 // Root route (optional)
@@ -243,7 +247,8 @@ app.post('/webhook/orders-create', async (req, res) => {
 
   // ── HubSpot reconciliation: order = truth, promote to CUSTOMER ────────────
   // Runs after B2B logic. Isolated — any failure here never affects Shopify response.
-  if (order.email && HUBSPOT_ACCESS_TOKEN) {
+  // Fires when either email OR checkout_token is present — handles email-mismatch cases.
+  if (HUBSPOT_ACCESS_TOKEN && (order.email || order.checkout_token)) {
     reconcileOrderContact(order).catch(err =>
       console.error('[HubSpot] reconcileOrderContact error:', err.message)
     );
@@ -434,13 +439,20 @@ app.post("/checkout-completed", async (req, res) => {
       }
     }
 
-    // Track in reconciliation map
+    // Track in reconciliation map — include token for order-side bridging
+    const checkoutToken = checkout.token || checkout.checkout_token || "";
     reconciliationMap.set(email, {
       status: "LEAD",
+      checkout_token: checkoutToken,
       firstname: checkout.first_name || "",
       lastname: checkout.last_name || "",
       timestamp: Date.now(),
     });
+
+    // Secondary index: token → email (survives email mismatch on order webhook)
+    if (checkoutToken) {
+      checkoutTokenMap.set(checkoutToken, email);
+    }
 
     res.status(200).json({ success: true });
   } catch (err) {
@@ -449,71 +461,103 @@ app.post("/checkout-completed", async (req, res) => {
   }
 });
 
+// ── HubSpot Contact Search Helper ─────────────────────────────────────────
+// Returns the HubSpot contact object for a given email, or null if not found.
+async function findHubSpotContactByEmail(email, hsHeaders) {
+  try {
+    const res = await axios.post(
+      "https://api.hubapi.com/crm/v3/objects/contacts/search",
+      {
+        filterGroups: [
+          { filters: [{ propertyName: "email", operator: "EQ", value: email }] },
+        ],
+        properties: ["email", "firstname", "lastname", "lifecyclestage"],
+        limit: 1,
+      },
+      { headers: hsHeaders }
+    );
+    return res.data.results.length > 0 ? res.data.results[0] : null;
+  } catch (err) {
+    console.error(`[HubSpot] Search failed for email (${email}):`, err.message);
+    return null;
+  }
+}
+
 // ── HubSpot Order Reconciliation Helper ───────────────────────────────────
 // Called after every orders/create webhook.
-// Finds or creates the HubSpot contact and promotes lifecycle to "customer".
-// Fixes any placeholder "Guest"/"Shopify" names written during the checkout step.
+// Matching strategy (in order):
+//   Step A — search HubSpot by order.email
+//   Step B — if Step A misses, bridge via order.checkout_token → checkoutTokenMap → email
+//   Last resort — create a new customer contact if no match at all
 async function reconcileOrderContact(order) {
-  const email = order.email;
   const hsHeaders = {
     Authorization: `Bearer ${HUBSPOT_ACCESS_TOKEN}`,
     "Content-Type": "application/json",
   };
 
-  // Resolve real name from order object (customer block or billing address)
+  // Order is the source of truth for real identity
   const firstname = order.customer?.first_name || order.billing_address?.first_name || "";
   const lastname  = order.customer?.last_name  || order.billing_address?.last_name  || "";
+  const orderEmail = (order.email || "").trim().toLowerCase();
 
-  // Search HubSpot for existing contact by email
-  const searchRes = await axios.post(
-    "https://api.hubapi.com/crm/v3/objects/contacts/search",
-    {
-      filterGroups: [
-        { filters: [{ propertyName: "email", operator: "EQ", value: email }] },
-      ],
-      properties: ["email", "firstname", "lastname", "lifecyclestage"],
-      limit: 1,
-    },
-    { headers: hsHeaders }
-  );
+  let contact      = null;
+  let resolvedEmail = orderEmail;
 
-  if (searchRes.data.results.length > 0) {
-    // ── Contact exists: update lifecycle + fix guest placeholder names ──────
-    const contact = searchRes.data.results[0];
-    const updateProps = { lifecyclestage: "customer" };
+  // ── Step A: match by order email ──────────────────────────────────────────
+  if (orderEmail) {
+    contact = await findHubSpotContactByEmail(orderEmail, hsHeaders);
+  }
 
-    if (!contact.properties?.firstname || contact.properties.firstname === "Guest") {
-      updateProps.firstname = firstname;
+  // ── Step B: fallback — bridge via checkout_token ───────────────────────────
+  // Covers the case where pixel email ≠ order email (e.g. guest changes email
+  // at payment step), or where order arrives with no email at all.
+  if (!contact && order.checkout_token) {
+    const tokenEmail = checkoutTokenMap.get(order.checkout_token);
+    if (tokenEmail) {
+      console.log(`[HubSpot] Bridging order ${order.id} via checkout_token → ${tokenEmail}`);
+      contact = await findHubSpotContactByEmail(tokenEmail, hsHeaders);
+      if (contact) resolvedEmail = tokenEmail;
     }
-    if (!contact.properties?.lastname || contact.properties.lastname === "Shopify") {
-      updateProps.lastname = lastname;
-    }
+  }
 
+  // Properties to write — always force customer stage and real names from order
+  const customerProps = { lifecyclestage: "customer" };
+  if (firstname) customerProps.firstname = firstname; // only overwrite if order has data
+  if (lastname)  customerProps.lastname  = lastname;
+
+  if (contact) {
+    // ── Contact found: promote to customer, always overwrite placeholder names ─
     await axios.patch(
       `https://api.hubapi.com/crm/v3/objects/contacts/${contact.id}`,
-      { properties: updateProps },
+      { properties: customerProps },
       { headers: hsHeaders }
     );
-    console.log(`[HubSpot] Contact ${contact.id} promoted to CUSTOMER (order ${order.id})`);
+    console.log(`[HubSpot] Contact ${contact.id} → CUSTOMER (order ${order.id})`);
   } else {
-    // ── No contact: create directly as customer ─────────────────────────────
+    // ── Last resort: create new customer contact ───────────────────────────────
+    const emailToUse = resolvedEmail || order.billing_address?.email || "";
+    if (!emailToUse) {
+      console.warn(`[HubSpot] No email available for order ${order.id} — skipping`);
+      return;
+    }
     const createRes = await axios.post(
       "https://api.hubapi.com/crm/v3/objects/contacts",
-      {
-        properties: { email, firstname, lastname, lifecyclestage: "customer" },
-      },
+      { properties: { email: emailToUse, ...customerProps } },
       { headers: hsHeaders }
     );
     console.log(`[HubSpot] New CUSTOMER contact created: ${createRes.data.id} (order ${order.id})`);
+    resolvedEmail = emailToUse;
   }
 
-  // Update reconciliation map — order is the final truth
-  reconciliationMap.set(email, {
-    status: "CUSTOMER",
-    firstname,
-    lastname,
-    timestamp: Date.now(),
-  });
+  // Update reconciliation map — order is always the final truth
+  if (resolvedEmail) {
+    reconciliationMap.set(resolvedEmail, {
+      status: "CUSTOMER",
+      firstname,
+      lastname,
+      timestamp: Date.now(),
+    });
+  }
 }
 
 const PORT = process.env.PORT || 3000;
