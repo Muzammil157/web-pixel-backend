@@ -380,7 +380,8 @@ app.post("/checkout-completed", async (req, res) => {
             ],
           },
         ],
-        properties: ["email", "firstname", "lastname", "lifecyclestage"],
+        properties: ["email", "firstname", "lastname", "lifecyclestage",
+                     "shopify_has_order", "shopify_is_abandoned", "contact_attempted"],
         limit: 1,
       },
       {
@@ -406,6 +407,10 @@ app.post("/checkout-completed", async (req, res) => {
             firstname: checkout.first_name || "",
             lastname: checkout.last_name || "",
             lifecyclestage: "lead",
+            // Segmentation flags — pixel/checkout = abandoned intent, never a purchase
+            shopify_has_order:   "false",
+            shopify_is_abandoned: "true",
+            contact_attempted:   "false",
           },
         },
         { headers: hsHeaders }
@@ -426,6 +431,17 @@ app.post("/checkout-completed", async (req, res) => {
         }
         if (!existing.properties?.lastname || existing.properties.lastname === "Shopify") {
           updateProps.lastname = checkout.last_name || "";
+        }
+
+        // Segmentation flags — only apply if this contact does NOT already have
+        // a confirmed order (shopify_has_order=true). Never overwrite purchase truth.
+        if (existing.properties?.shopify_has_order !== "true") {
+          updateProps.shopify_has_order    = "false";
+          updateProps.shopify_is_abandoned = "true";
+          // Preserve contact_attempted if marketing already set it to true
+          if (existing.properties?.contact_attempted !== "true") {
+            updateProps.contact_attempted = "false";
+          }
         }
 
         await axios.patch(
@@ -471,7 +487,8 @@ async function findHubSpotContactByEmail(email, hsHeaders) {
         filterGroups: [
           { filters: [{ propertyName: "email", operator: "EQ", value: email }] },
         ],
-        properties: ["email", "firstname", "lastname", "lifecyclestage"],
+        properties: ["email", "firstname", "lastname", "lifecyclestage",
+                     "shopify_has_order", "shopify_is_abandoned", "contact_attempted"],
         limit: 1,
       },
       { headers: hsHeaders }
@@ -520,9 +537,15 @@ async function reconcileOrderContact(order) {
     }
   }
 
-  // Properties to write — always force customer stage and real names from order
-  const customerProps = { lifecyclestage: "customer" };
-  if (firstname) customerProps.firstname = firstname; // only overwrite if order has data
+  // Properties to write — order is the source of truth for purchase state
+  // contact_attempted is intentionally excluded: marketing engagement state is
+  // independent of purchase state and must never be reset by an order event.
+  const customerProps = {
+    lifecyclestage:       "customer",
+    shopify_has_order:    "true",   // PURCHASE TRUTH — only ever set here
+    shopify_is_abandoned: "false",  // order cancels abandoned state
+  };
+  if (firstname) customerProps.firstname = firstname;
   if (lastname)  customerProps.lastname  = lastname;
 
   if (contact) {
