@@ -2,6 +2,64 @@
 
 ---
 
+## [2026-04-20] Shopify Admin API checkout fetch + generateCartHTML crash fix
+
+**Branch:** `hubspot-new`
+**File changed:** `index.js` only — 1 new function, 1 function fix, 1 route refactor
+
+### Problem being fixed
+
+Two issues:
+1. Webhook payload `line_items` from Shopify Web Pixel uses a different schema than the Admin API — field paths like `item.variant.price.amount` crash with `Cannot read properties of null` when `item.variant` is null or absent.
+2. `abandoned_checkout_url` / `checkout_url` in webhook payload are unreliable — often empty for pixel events; the Shopify Admin API `GET /checkouts/{token}.json` returns the authoritative checkout object including `web_url`, real customer addresses, and full line item detail.
+
+### `fetchFullCheckoutFromShopify(checkoutToken)` — new async helper
+
+Added directly before `generateCartHTML`. Calls:
+```
+GET https://{shop}/admin/api/2026-01/checkouts/{token}.json
+```
+with `X-Shopify-Access-Token`. Returns `checkout` object on success, `null` on failure (never throws). Shop domain resolved from `SHOPIFY_SHOP_DOMAIN` env var, falls back to hardcoded `medical-and-lab-supplies.myshopify.com`.
+
+### `generateCartHTML` — safe optional chaining fix
+
+Old (crashes when `item.variant` is null):
+```js
+const price      = item.variant.price.amount        || "0.00";
+const imageUrl   = item.variant.image.src           || item.image_url || "";
+const productUrl = item.variant.product.url         || item.product_url || item.variant_url || "#";
+```
+
+New (safe fallback chain):
+```js
+const price      = item.variant?.price?.amount || item.price || "0.00";
+const imageUrl   = item.variant?.image?.src    || item.image || item.image_url || "";
+const productUrl = item.variant?.product?.url  || item.url   || item.product_url || item.variant_url || "#";
+```
+
+### `/checkout-completed` — webhook as trigger only
+
+**Before:** used `req.body` (webhook payload) directly for line items, URL, and customer name.
+
+**After:**
+1. Extract `webhookToken` from `req.body.token` or `req.body.checkout_token`
+2. Call `fetchFullCheckoutFromShopify(webhookToken)` — if fetch succeeds, use returned object as `checkout`; otherwise fall back to `req.body`
+3. Resolve `firstName`/`lastName` from `checkout.billing_address` → `checkout.shipping_address` → `checkout.first_name` → `webhookCheckout.first_name`
+4. Resolve `email` from `checkout.email` → `webhookCheckout.email`
+5. `checkoutUrl` now uses `checkout.abandoned_checkout_url || checkout.web_url || ""`
+6. `generateCartHTML` now called with Admin API `checkout.line_items`
+
+`firstName`/`lastName` variables replace all direct `checkout.first_name` / `checkout.last_name` references throughout the route (create path, update path, reconciliation map write).
+
+### What was NOT changed
+- All HubSpot create/update/search logic — untouched
+- All segmentation flag logic — untouched
+- All reconciliation map / checkoutTokenMap logic — untouched
+- `reconcileOrderContact` — untouched
+- `orders/create` webhook — untouched
+
+---
+
 ## [2026-04-16] Abandoned cart HTML + checkout URL pushed to HubSpot
 
 **Branch:** `hubspot-new`
