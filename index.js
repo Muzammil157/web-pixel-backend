@@ -350,6 +350,23 @@ app.post('/webhook/orders-create', async (req, res) => {
 // });
 
 
+// ── Shopify Admin API Checkout Fetch ──────────────────────────────────────
+// Fetches the full checkout object from Shopify Admin API using the checkout token.
+// Returns the checkout object on success, or null on failure (falls back to webhook payload).
+async function fetchFullCheckoutFromShopify(checkoutToken) {
+  const shop = process.env.SHOPIFY_SHOP_DOMAIN || "medical-and-lab-supplies.myshopify.com";
+  try {
+    const response = await axios.get(
+      `https://${shop}/admin/api/2026-01/checkouts/${checkoutToken}.json`,
+      { headers: { "X-Shopify-Access-Token": SHOPIFY_ACCESS_TOKEN } }
+    );
+    return response.data.checkout || null;
+  } catch (err) {
+    console.error("[Shopify] fetchFullCheckoutFromShopify failed:", err.response?.data || err.message);
+    return null;
+  }
+}
+
 // ── Abandoned Cart HTML Helper ─────────────────────────────────────────────
 // Generates an email-safe, table-based HTML string from Shopify line items.
 // Used to populate shopify_abandoned_cart_html on the HubSpot contact.
@@ -358,10 +375,10 @@ function generateCartHTML(lineItems) {
 
   return lineItems.map(item => {
     const title      = item.title        || "Product";
-    const price      = item.price        || "0.00";
+    const price      = item.variant?.price?.amount || item.price || "0.00";
     const quantity   = item.quantity     || 1;
-    const imageUrl   = item.image        || item.image_url || "";
-    const productUrl = item.url          || item.product_url
+    const imageUrl   = item.variant?.image?.src    || item.image || item.image_url || "";
+    const productUrl = item.variant?.product?.url  || item.url   || item.product_url
                     || item.variant_url  || "#";
 
     const imgTag = imageUrl
@@ -385,17 +402,34 @@ function generateCartHTML(lineItems) {
 
 // Shopify webhook endpoint for contact creation
 app.post("/checkout-completed", async (req, res) => {
-  const checkout = req.body;
+  const webhookCheckout = req.body;
 
   if (!HUBSPOT_ACCESS_TOKEN) {
     return res.status(400).json({ error: "HubSpot not authorized yet" });
   }
 
   try {
-    const email = checkout.email;
-    if (!email || email.trim() === "") {
+    // ── Use webhook only as trigger; fetch full checkout from Shopify Admin API ──
+    const webhookToken = webhookCheckout.token || webhookCheckout.checkout_token || "";
+    const fullCheckout = webhookToken ? await fetchFullCheckoutFromShopify(webhookToken) : null;
+    const checkout     = fullCheckout || webhookCheckout; // fallback to webhook payload if fetch fails
+
+    // Prefer Admin API checkout data for names and email; fall back to webhook payload fields
+    const firstName = checkout.billing_address?.first_name
+                   || checkout.shipping_address?.first_name
+                   || checkout.first_name
+                   || webhookCheckout.first_name
+                   || "";
+    const lastName  = checkout.billing_address?.last_name
+                   || checkout.shipping_address?.last_name
+                   || checkout.last_name
+                   || webhookCheckout.last_name
+                   || "";
+    const email = (checkout.email || webhookCheckout.email || "").trim();
+
+    if (!email) {
       console.log("Skipping HubSpot contact creation because email is empty");
-      return;
+      return res.status(200).json({ success: true });
     }
 
     // 1️⃣ Check if contact already exists
@@ -431,8 +465,9 @@ app.post("/checkout-completed", async (req, res) => {
     };
 
     // ── Abandoned cart data — computed once, injected into both create + update ──
+    // Use Admin API checkout for reliable line_items and URL; web_url is the canonical checkout URL
     const abandonedCartHTML = generateCartHTML(checkout.line_items);
-    const checkoutUrl       = checkout.abandoned_checkout_url || checkout.checkout_url || "";
+    const checkoutUrl       = checkout.abandoned_checkout_url || checkout.web_url || "";
 
     if (searchResponse.data.results.length === 0) {
       // 2️⃣ No contact yet — create as LEAD only (pixel = intent, not purchase)
@@ -441,8 +476,8 @@ app.post("/checkout-completed", async (req, res) => {
         {
           properties: {
             email: email,
-            firstname: checkout.first_name || "",
-            lastname: checkout.last_name || "",
+            firstname: firstName,
+            lastname: lastName,
             lifecyclestage: "lead",
             // Segmentation flags — pixel/checkout = abandoned intent, never a purchase
             shopify_has_order:   "false",
@@ -467,10 +502,10 @@ app.post("/checkout-completed", async (req, res) => {
 
         // Fix placeholder names set by previous "Guest"/"Shopify" fallback
         if (!existing.properties?.firstname || existing.properties.firstname === "Guest") {
-          updateProps.firstname = checkout.first_name || "";
+          updateProps.firstname = firstName;
         }
         if (!existing.properties?.lastname || existing.properties.lastname === "Shopify") {
-          updateProps.lastname = checkout.last_name || "";
+          updateProps.lastname = lastName;
         }
 
         // Segmentation flags — only apply if this contact does NOT already have
@@ -500,12 +535,12 @@ app.post("/checkout-completed", async (req, res) => {
     }
 
     // Track in reconciliation map — include token for order-side bridging
-    const checkoutToken = checkout.token || checkout.checkout_token || "";
+    const checkoutToken = webhookToken || checkout.token || checkout.checkout_token || "";
     reconciliationMap.set(email, {
       status: "LEAD",
       checkout_token: checkoutToken,
-      firstname: checkout.first_name || "",
-      lastname: checkout.last_name || "",
+      firstname: firstName,
+      lastname: lastName,
       timestamp: Date.now(),
     });
 
