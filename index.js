@@ -350,6 +350,39 @@ app.post('/webhook/orders-create', async (req, res) => {
 // });
 
 
+// ── Abandoned Cart HTML Helper ─────────────────────────────────────────────
+// Generates an email-safe, table-based HTML string from Shopify line items.
+// Used to populate shopify_abandoned_cart_html on the HubSpot contact.
+function generateCartHTML(lineItems) {
+  if (!Array.isArray(lineItems) || lineItems.length === 0) return "";
+
+  return lineItems.map(item => {
+    const title      = item.title        || "Product";
+    const price      = item.price        || "0.00";
+    const quantity   = item.quantity     || 1;
+    const imageUrl   = item.image        || item.image_url || "";
+    const productUrl = item.url          || item.product_url
+                    || item.variant_url  || "#";
+
+    const imgTag = imageUrl
+      ? `<img src="${imageUrl}" width="100" style="border-radius:8px;display:block;" alt="${title}" />`
+      : `<div style="width:100px;height:100px;background:#f0f0f0;border-radius:8px;"></div>`;
+
+    return (
+      `<table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:15px;border-collapse:collapse;">` +
+        `<tr>` +
+          `<td width="100" style="padding-right:10px;vertical-align:top;">${imgTag}</td>` +
+          `<td style="vertical-align:top;">` +
+            `<p style="margin:0;font-size:16px;font-weight:bold;color:#111;">${title}</p>` +
+            `<p style="margin:5px 0;color:#555;font-size:14px;">Rs. ${price} (Qty: ${quantity})</p>` +
+            `<a href="${productUrl}" style="color:#007bff;text-decoration:none;font-size:14px;">View Product</a>` +
+          `</td>` +
+        `</tr>` +
+      `</table>`
+    );
+  }).join("");
+}
+
 // Shopify webhook endpoint for contact creation
 app.post("/checkout-completed", async (req, res) => {
   const checkout = req.body;
@@ -397,6 +430,10 @@ app.post("/checkout-completed", async (req, res) => {
       "Content-Type": "application/json",
     };
 
+    // ── Abandoned cart data — computed once, injected into both create + update ──
+    const abandonedCartHTML = generateCartHTML(checkout.line_items);
+    const checkoutUrl       = checkout.abandoned_checkout_url || checkout.checkout_url || "";
+
     if (searchResponse.data.results.length === 0) {
       // 2️⃣ No contact yet — create as LEAD only (pixel = intent, not purchase)
       const contactResponse = await axios.post(
@@ -411,6 +448,9 @@ app.post("/checkout-completed", async (req, res) => {
             shopify_has_order:   "false",
             shopify_is_abandoned: "true",
             contact_attempted:   "false",
+            // Abandoned cart data
+            shopify_abandoned_cart_html: abandonedCartHTML,
+            shopify_checkout_url:        checkoutUrl,
           },
         },
         { headers: hsHeaders }
@@ -443,6 +483,10 @@ app.post("/checkout-completed", async (req, res) => {
             updateProps.contact_attempted = "false";
           }
         }
+
+        // Always update abandoned cart data — reflects the latest checkout session
+        updateProps.shopify_abandoned_cart_html = abandonedCartHTML;
+        updateProps.shopify_checkout_url        = checkoutUrl;
 
         await axios.patch(
           `https://api.hubapi.com/crm/v3/objects/contacts/${existing.id}`,

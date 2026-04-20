@@ -2,6 +2,62 @@
 
 ---
 
+## [2026-04-16] Abandoned cart HTML + checkout URL pushed to HubSpot
+
+**Branch:** `hubspot-new`
+**File changed:** `index.js` only — 1 new helper function, 2 injections into existing payloads
+
+### New HubSpot contact properties required
+
+> Create these in HubSpot before deploying: Settings → Properties → Contact → Create property
+
+| Property | Type | Set by |
+|---|---|---|
+| `shopify_abandoned_cart_html` | Single-line text (or rich text) | `/checkout-completed` |
+| `shopify_checkout_url` | Single-line text | `/checkout-completed` |
+
+### `generateCartHTML(lineItems)` — new helper function
+
+Placed directly above the `/checkout-completed` route. Takes `checkout.line_items` array and returns a single inline-CSS, table-based HTML string safe for email clients (Gmail, Outlook).
+
+Per item renders:
+- 100px product image (with `border-radius:8px`) — falls back to a grey placeholder `<div>` if no image URL
+- Product title in bold
+- `Rs. PRICE (Qty: X)`
+- "View Product" link — falls back to `#` if no URL
+
+Field resolution order per item:
+
+| Field | Tries in order |
+|---|---|
+| Image | `item.image` → `item.image_url` |
+| URL | `item.url` → `item.product_url` → `item.variant_url` → `"#"` |
+
+Empty or missing `line_items` → returns `""` (never crashes).
+
+### Injected into `/checkout-completed` (both paths)
+
+Computed once before the if/else block:
+```js
+const abandonedCartHTML = generateCartHTML(checkout.line_items);
+const checkoutUrl       = checkout.abandoned_checkout_url || checkout.checkout_url || "";
+```
+
+**Create path (new contact):** added to properties object alongside existing flags.
+
+**Update path (existing contact, not already customer):** added to `updateProps` unconditionally — always reflects the latest checkout session regardless of segmentation flag guards.
+
+### What was NOT changed
+- `reconciliationMap` / `checkoutTokenMap` — untouched
+- `reconcileOrderContact` — untouched
+- `orders/create` webhook — untouched
+- All segmentation flag logic — untouched
+- All lifecycle logic — untouched
+
+---
+
+---
+
 ## [2026-04-16] HubSpot segmentation flags — shopify_has_order, shopify_is_abandoned, contact_attempted
 
 **Branch:** `hubspot-new`
