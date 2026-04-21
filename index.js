@@ -465,9 +465,15 @@ app.post("/checkout-completed", async (req, res) => {
     };
 
     // ── Abandoned cart data — computed once, injected into both create + update ──
-    // Use Admin API checkout for reliable line_items and URL; web_url is the canonical checkout URL
+    // checkoutUrl priority:
+    //   1. web_url from Admin API — the actual live checkout page URL
+    //   2. abandoned_checkout_url — Shopify's recovery URL (sometimes absent for pixel events)
+    //   3. Constructed from token — guaranteed fallback when the API fields are empty
+    const shop = process.env.SHOPIFY_SHOP_DOMAIN || "medical-and-lab-supplies.myshopify.com";
     const abandonedCartHTML = generateCartHTML(checkout.line_items);
-    const checkoutUrl       = checkout.abandoned_checkout_url || checkout.web_url || "";
+    const checkoutUrl = checkout.web_url
+                     || checkout.abandoned_checkout_url
+                     || (webhookToken ? `https://${shop}/checkouts/${webhookToken}` : "");
 
     if (searchResponse.data.results.length === 0) {
       // 2️⃣ No contact yet — create as LEAD only (pixel = intent, not purchase)

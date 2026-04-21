@@ -2,6 +2,34 @@
 
 ---
 
+## [2026-04-21] Reliable checkout URL for shopify_checkout_url property
+
+**Branch:** `hubspot-new`
+**File changed:** `index.js` only — 1 targeted change in `/checkout-completed`
+
+### Problem being fixed
+
+`abandoned_checkout_url` is often empty for Shopify Web Pixel events. `checkoutUrl` fell back to `checkout.web_url` but if that was also missing the property was written as an empty string.
+
+### New priority chain for `checkoutUrl`
+
+```
+1. checkout.web_url               ← live checkout page URL from Admin API (most reliable)
+2. checkout.abandoned_checkout_url ← Shopify recovery URL (fallback)
+3. https://{shop}/checkouts/{token} ← constructed from token (guaranteed fallback when token present)
+```
+
+`web_url` from the Admin API response is the actual checkout page URL the customer was on when the pixel event fired. It is now the primary source instead of `abandoned_checkout_url`.
+
+### What was NOT changed
+- All HubSpot create/update/search logic — untouched
+- All segmentation flag logic — untouched
+- `generateCartHTML` — untouched
+- `fetchFullCheckoutFromShopify` — untouched
+- `reconcileOrderContact` — untouched
+
+---
+
 ## [2026-04-20] Shopify Admin API checkout fetch + generateCartHTML crash fix
 
 **Branch:** `hubspot-new`
