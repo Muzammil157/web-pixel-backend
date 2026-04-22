@@ -2,6 +2,52 @@
 
 ---
 
+## [2026-04-22] Capture checkout page URL from pixel JS via page_url field
+
+**Branch:** `hubspot-new`
+**File changed:** `index.js` only — 1 line change in `/checkout-completed`
+
+### Problem being fixed
+
+Admin API `web_url` and `abandoned_checkout_url` are server-side fields that don't always reflect the exact URL the customer was on when the pixel event fired. The most accurate source is `document.location.href` captured by the pixel JavaScript at the moment the event is triggered.
+
+### Change
+
+`checkoutUrl` now checks `webhookCheckout.page_url` first — a field the pixel JS must send in the payload:
+
+```js
+const checkoutUrl = webhookCheckout.page_url        // ← pixel JS: document.location.href
+                 || checkout.web_url                 // Admin API live URL
+                 || checkout.abandoned_checkout_url  // Shopify recovery URL
+                 || `https://${shop}/checkouts/${webhookToken}`; // constructed fallback
+```
+
+### Required pixel JS change (in Shopify partner dashboard)
+
+In the pixel event handler, add `page_url: document.location.href` to the payload before POSTing to `/checkout-completed`:
+
+```js
+analytics.subscribe("checkout_completed", (event) => {
+  const payload = {
+    ...event.data.checkout,
+    page_url: document.location.href,
+  };
+  fetch("https://your-backend.com/checkout-completed", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+});
+```
+
+### What was NOT changed
+- All HubSpot logic — untouched
+- `fetchFullCheckoutFromShopify` — untouched
+- `generateCartHTML` — untouched
+- `reconcileOrderContact` — untouched
+
+---
+
 ## [2026-04-21] Reliable checkout URL for shopify_checkout_url property
 
 **Branch:** `hubspot-new`
