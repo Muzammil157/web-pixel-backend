@@ -28,6 +28,11 @@ const reconciliationMap = new Map();
 // Populated by /checkout-completed, consumed by reconcileOrderContact.
 const checkoutTokenMap = new Map();
 
+// Abandoned checkout URL index: checkout_token → abandoned_checkout_url
+// Populated by /webhook/checkout-create (Shopify webhook — has the real recovery URL).
+// Consumed by /checkout-completed to set shopify_checkout_url on the HubSpot contact.
+const abandonedUrlMap = new Map();
+
 
 // Root route (optional)
 app.get("/", (req, res) => {
@@ -196,10 +201,16 @@ app.post('/webhook/checkout-create', (req, res) => {
   res.sendStatus(200); // respond fast to Shopify
 
   const checkout = req.body;
+  const token               = checkout.token || "";
   const abandonedCheckoutUrl = checkout.abandoned_checkout_url || "";
 
   console.log('[Shopify] checkout/create webhook received');
   console.log('[Shopify] abandoned_checkout_url:', abandonedCheckoutUrl);
+
+  // Store the real recovery URL so /checkout-completed can use it when the pixel fires
+  if (token && abandonedCheckoutUrl) {
+    abandonedUrlMap.set(token, abandonedCheckoutUrl);
+  }
 });
 
 app.post('/webhook/orders-create', async (req, res) => {
@@ -446,11 +457,12 @@ app.post("/checkout-completed", async (req, res) => {
     };
 
     // ── Abandoned cart data — computed once, injected into both create + update ──
-    // Pixel sends line_items with image_url + url from the storefront context.
-    // Checkout URL is constructed from the token — reliable and always available.
+    // checkoutUrl: use the real Shopify recovery URL stored by /webhook/checkout-create,
+    // fall back to constructing from token if the checkout/create webhook hasn't fired yet.
     const shop = process.env.SHOPIFY_SHOP_DOMAIN || "medical-and-lab-supplies.myshopify.com";
     const abandonedCartHTML = generateCartHTML(webhookCheckout.line_items);
-    const checkoutUrl = webhookToken ? `https://${shop}/checkouts/${webhookToken}` : "";
+    const checkoutUrl = (webhookToken && abandonedUrlMap.get(webhookToken))
+                     || (webhookToken ? `https://${shop}/checkouts/${webhookToken}` : "");
 
     if (searchResponse.data.results.length === 0) {
       // 2️⃣ No contact yet — create as LEAD only (pixel = intent, not purchase)
