@@ -192,6 +192,16 @@ app.post("/connect-pixel", async (req, res) => {
 }
 });
 
+app.post('/webhook/checkout-create', (req, res) => {
+  res.sendStatus(200); // respond fast to Shopify
+
+  const checkout = req.body;
+  const abandonedCheckoutUrl = checkout.abandoned_checkout_url || "";
+
+  console.log('[Shopify] checkout/create webhook received');
+  console.log('[Shopify] abandoned_checkout_url:', abandonedCheckoutUrl);
+});
+
 app.post('/webhook/orders-create', async (req, res) => {
   const order = req.body;
 
