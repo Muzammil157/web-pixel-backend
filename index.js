@@ -466,14 +466,12 @@ app.post("/checkout-completed", async (req, res) => {
 
     // ── Abandoned cart data — computed once, injected into both create + update ──
     // checkoutUrl priority:
-    //   1. page_url sent by pixel JS (document.location.href at moment of event) — most accurate
-    //   2. web_url from Admin API — live checkout page URL
-    //   3. abandoned_checkout_url — Shopify recovery URL (sometimes absent for pixel events)
-    //   4. Constructed from token — guaranteed fallback when all other fields are empty
+    //   1. web_url from Admin API — the actual live checkout page URL
+    //   2. abandoned_checkout_url — Shopify's recovery URL (sometimes absent for pixel events)
+    //   3. Constructed from token — guaranteed fallback when the API fields are empty
     const shop = process.env.SHOPIFY_SHOP_DOMAIN || "medical-and-lab-supplies.myshopify.com";
     const abandonedCartHTML = generateCartHTML(checkout.line_items);
-    const checkoutUrl = webhookCheckout.page_url
-                     || checkout.web_url
+    const checkoutUrl = checkout.web_url
                      || checkout.abandoned_checkout_url
                      || (webhookToken ? `https://${shop}/checkouts/${webhookToken}` : "");
 
