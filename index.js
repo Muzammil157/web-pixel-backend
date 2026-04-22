@@ -470,7 +470,9 @@ app.post("/checkout-completed", async (req, res) => {
     //   2. abandoned_checkout_url — Shopify's recovery URL (sometimes absent for pixel events)
     //   3. Constructed from token — guaranteed fallback when the API fields are empty
     const shop = process.env.SHOPIFY_SHOP_DOMAIN || "medical-and-lab-supplies.myshopify.com";
-    const abandonedCartHTML = generateCartHTML(checkout.line_items);
+    // Pixel line_items carry image_url + url from the storefront; Admin API line_items do not.
+    // Use pixel line_items for the cart HTML, fall back to Admin API line_items if pixel didn't send them.
+    const abandonedCartHTML = generateCartHTML(webhookCheckout.line_items || checkout.line_items);
     const checkoutUrl = checkout.web_url
                      || checkout.abandoned_checkout_url
                      || (webhookToken ? `https://${shop}/checkouts/${webhookToken}` : "");

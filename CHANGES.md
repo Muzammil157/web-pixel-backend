@@ -2,6 +2,36 @@
 
 ---
 
+## [2026-04-22] Fix cart HTML using pixel line_items instead of Admin API line_items
+
+**Branch:** `hubspot-new`
+**File changed:** `index.js` only — 1 line change
+
+### Problem being fixed
+
+`generateCartHTML(checkout.line_items)` was passing Admin API line items, which have no inline images or product URLs — every cart item rendered with a grey placeholder box and a dead `#` link.
+
+The pixel payload line_items carry `image_url` and `url` from the storefront. These map directly to the fallback chain in `generateCartHTML` (`item.image_url`, `item.url`).
+
+### Fix
+
+```js
+// Before:
+generateCartHTML(checkout.line_items)
+
+// After:
+generateCartHTML(webhookCheckout.line_items || checkout.line_items)
+```
+
+Pixel line_items are tried first (has images + URLs). Admin API line_items are the fallback (safe, no crash, just grey boxes).
+
+### What was NOT changed
+- All other cart HTML logic — untouched
+- All HubSpot/segmentation logic — untouched
+- Admin API fetch — still used for email, names, checkout URL
+
+---
+
 ## [2026-04-21] Reliable checkout URL for shopify_checkout_url property
 
 **Branch:** `hubspot-new`
