@@ -36,54 +36,54 @@ app.get("/", (req, res) => {
 
 
 // // STEP 1: Install route
-// app.get('/install', (req, res) => {
-//   const shop = req.query.shop;
+app.get('/install', (req, res) => {
+  const shop = req.query.shop;
 
-//   if (!shop) {
-//     return res.send('Missing shop parameter');
-//   }
+  if (!shop) {
+    return res.send('Missing shop parameter');
+  }
 
-//   const installUrl = `https://${shop}/admin/oauth/authorize?client_id=${process.env.SHOPIFY_CLIENT_ID}&scope=${process.env.SCOPES}&redirect_uri=${process.env.SHOPIFY_REDIRECT_URI}`;
+  const installUrl = `https://${shop}/admin/oauth/authorize?client_id=${process.env.SHOPIFY_CLIENT_ID}&scope=${process.env.SCOPES}&redirect_uri=${process.env.SHOPIFY_REDIRECT_URI}`;
 
-//   res.redirect(installUrl);
-// });
+  res.redirect(installUrl);
+});
 
-// // STEP 2: Callback route (THIS MUST MATCH YOUR REDIRECT URI)
-// app.get('/oauth/callback', async (req, res) => {
-//   const { shop, code } = req.query;
+// STEP 2: Callback route (THIS MUST MATCH YOUR REDIRECT URI)
+app.get('/oauth/callback', async (req, res) => {
+  const { shop, code } = req.query;
 
-//   if (!shop || !code) {
-//     return res.send('Missing shop or code');
-//   }
+  if (!shop || !code) {
+    return res.send('Missing shop or code');
+  }
 
-//   try {
-//     // STEP 3: Exchange code for token
-//     const response = await axios.post(
-//       `https://${shop}/admin/oauth/access_token`,
-//       {
-//         client_id: process.env.SHOPIFY_CLIENT_ID,
-//         client_secret: process.env.SHOPIFY_CLIENT_SECRET,
-//         code
-//       }
-//     );
+  try {
+    // STEP 3: Exchange code for token
+    const response = await axios.post(
+      `https://${shop}/admin/oauth/access_token`,
+      {
+        client_id: process.env.SHOPIFY_CLIENT_ID,
+        client_secret: process.env.SHOPIFY_CLIENT_SECRET,
+        code
+      }
+    );
 
-//     const accessToken = response.data.access_token;
+    const accessToken = response.data.access_token;
 
-//     console.log('✅ ACCESS TOKEN:', accessToken);
+    console.log('✅ ACCESS TOKEN:', accessToken);
 
-//     // 👉 Save this somewhere (DB ideally)
-//     res.send(`
-//       <h2>App Installed Successfully 🎉</h2>
-//       <p>Store: ${shop}</p>
-//       <p><strong>Access Token:</strong></p>
-//       <code>${accessToken}</code>
-//     `);
+    // 👉 Save this somewhere (DB ideally)
+    res.send(`
+      <h2>App Installed Successfully 🎉</h2>
+      <p>Store: ${shop}</p>
+      <p><strong>Access Token:</strong></p>
+      <code>${accessToken}</code>
+    `);
 
-//   } catch (error) {
-//     console.error('❌ ERROR:', error.response?.data || error.message);
-//     res.send('Error generating token');
-//   }
-// });
+  } catch (error) {
+    console.error('❌ ERROR:', error.response?.data || error.message);
+    res.send('Error generating token');
+  }
+});
 
 // 1️⃣ Start OAuth flow
 // app.get("/oauth/start", (req, res) => {
@@ -470,7 +470,9 @@ app.post("/checkout-completed", async (req, res) => {
     //   2. abandoned_checkout_url — Shopify's recovery URL (sometimes absent for pixel events)
     //   3. Constructed from token — guaranteed fallback when the API fields are empty
     const shop = process.env.SHOPIFY_SHOP_DOMAIN || "medical-and-lab-supplies.myshopify.com";
-    const abandonedCartHTML = generateCartHTML(checkout.line_items);
+    // Pixel line_items carry image_url + url from the storefront; Admin API line_items do not.
+    // Use pixel line_items for the cart HTML, fall back to Admin API line_items if pixel didn't send them.
+    const abandonedCartHTML = generateCartHTML(webhookCheckout.line_items || checkout.line_items);
     const checkoutUrl = checkout.web_url
                      || checkout.abandoned_checkout_url
                      || (webhookToken ? `https://${shop}/checkouts/${webhookToken}` : "");
