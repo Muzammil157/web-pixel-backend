@@ -204,8 +204,8 @@ app.post('/webhook/checkout-create', (req, res) => {
   const token               = checkout.token || "";
   const abandonedCheckoutUrl = checkout.abandoned_checkout_url || "";
 
-  console.log('[Shopify] checkout/create webhook received');
-  console.log('[Shopify] abandoned_checkout_url:', abandonedCheckoutUrl);
+  // console.log('[Shopify] checkout/create webhook received');
+  // console.log('[Shopify] abandoned_checkout_url:', abandonedCheckoutUrl);
 
   // Store the real recovery URL so /checkout-completed can use it when the pixel fires
   if (token && abandonedCheckoutUrl) {
