@@ -350,23 +350,6 @@ app.post('/webhook/orders-create', async (req, res) => {
 // });
 
 
-// ── Shopify Admin API Checkout Fetch ──────────────────────────────────────
-// Fetches the full checkout object from Shopify Admin API using the checkout token.
-// Returns the checkout object on success, or null on failure (falls back to webhook payload).
-async function fetchFullCheckoutFromShopify(checkoutToken) {
-  const shop = process.env.SHOPIFY_SHOP_DOMAIN || "medical-and-lab-supplies.myshopify.com";
-  try {
-    const response = await axios.get(
-      `https://${shop}/admin/api/2026-01/checkouts/${checkoutToken}.json`,
-      { headers: { "X-Shopify-Access-Token": SHOPIFY_ACCESS_TOKEN } }
-    );
-    return response.data.checkout || null;
-  } catch (err) {
-    console.error("[Shopify] fetchFullCheckoutFromShopify failed:", err.response?.data || err.message);
-    return null;
-  }
-}
-
 // ── Abandoned Cart HTML Helper ─────────────────────────────────────────────
 // Generates an email-safe, table-based HTML string from Shopify line items.
 // Used to populate shopify_abandoned_cart_html on the HubSpot contact.
@@ -409,23 +392,11 @@ app.post("/checkout-completed", async (req, res) => {
   }
 
   try {
-    // ── Use webhook only as trigger; fetch full checkout from Shopify Admin API ──
+    // ── Pixel payload is the sole source of truth (Shopify Checkout REST API is deprecated) ──
     const webhookToken = webhookCheckout.token || webhookCheckout.checkout_token || "";
-    const fullCheckout = webhookToken ? await fetchFullCheckoutFromShopify(webhookToken) : null;
-    const checkout     = fullCheckout || webhookCheckout; // fallback to webhook payload if fetch fails
-
-    // Prefer Admin API checkout data for names and email; fall back to webhook payload fields
-    const firstName = checkout.billing_address?.first_name
-                   || checkout.shipping_address?.first_name
-                   || checkout.first_name
-                   || webhookCheckout.first_name
-                   || "";
-    const lastName  = checkout.billing_address?.last_name
-                   || checkout.shipping_address?.last_name
-                   || checkout.last_name
-                   || webhookCheckout.last_name
-                   || "";
-    const email = (checkout.email || webhookCheckout.email || "").trim();
+    const firstName    = webhookCheckout.first_name || "";
+    const lastName     = webhookCheckout.last_name  || "";
+    const email        = (webhookCheckout.email || "").trim();
 
     if (!email) {
       console.log("Skipping HubSpot contact creation because email is empty");
@@ -465,17 +436,11 @@ app.post("/checkout-completed", async (req, res) => {
     };
 
     // ── Abandoned cart data — computed once, injected into both create + update ──
-    // checkoutUrl priority:
-    //   1. web_url from Admin API — the actual live checkout page URL
-    //   2. abandoned_checkout_url — Shopify's recovery URL (sometimes absent for pixel events)
-    //   3. Constructed from token — guaranteed fallback when the API fields are empty
+    // Pixel sends line_items with image_url + url from the storefront context.
+    // Checkout URL is constructed from the token — reliable and always available.
     const shop = process.env.SHOPIFY_SHOP_DOMAIN || "medical-and-lab-supplies.myshopify.com";
-    // Pixel line_items carry image_url + url from the storefront; Admin API line_items do not.
-    // Use pixel line_items for the cart HTML, fall back to Admin API line_items if pixel didn't send them.
-    const abandonedCartHTML = generateCartHTML(webhookCheckout.line_items || checkout.line_items);
-    const checkoutUrl = checkout.web_url
-                     || checkout.abandoned_checkout_url
-                     || (webhookToken ? `https://${shop}/checkouts/${webhookToken}` : "");
+    const abandonedCartHTML = generateCartHTML(webhookCheckout.line_items);
+    const checkoutUrl = webhookToken ? `https://${shop}/checkouts/${webhookToken}` : "";
 
     if (searchResponse.data.results.length === 0) {
       // 2️⃣ No contact yet — create as LEAD only (pixel = intent, not purchase)
@@ -543,7 +508,7 @@ app.post("/checkout-completed", async (req, res) => {
     }
 
     // Track in reconciliation map — include token for order-side bridging
-    const checkoutToken = webhookToken || checkout.token || checkout.checkout_token || "";
+    const checkoutToken = webhookToken;
     reconciliationMap.set(email, {
       status: "LEAD",
       checkout_token: checkoutToken,

@@ -2,6 +2,46 @@
 
 ---
 
+## [2026-04-22] Remove deprecated Shopify Checkout API fetch — use pixel payload directly
+
+**Branch:** `hubspot-new`
+**File changed:** `index.js` only — removed `fetchFullCheckoutFromShopify`, simplified `/checkout-completed`
+
+### Problem being fixed
+
+`GET /admin/api/2026-01/checkouts/{token}.json` is fully deprecated by Shopify and returns:
+`"The REST Checkout API is deprecated"` regardless of scopes.
+
+### Changes
+
+- **Removed** `fetchFullCheckoutFromShopify()` entirely
+- **`/checkout-completed`** now uses the pixel payload (`req.body`) as the sole data source:
+  - `email`, `first_name`, `last_name` — read directly from pixel payload
+  - `line_items` — pixel payload (carries `image_url` + `url` from storefront)
+  - `checkoutUrl` — constructed from token: `https://{shop}/checkouts/{token}`
+- Removed all `checkout` / `fullCheckout` / `webhookCheckout` branching — single source now
+
+### Pixel payload must include (no change from previous requirement)
+
+```js
+token: checkout.token,
+first_name: checkout.billingAddress?.firstName,
+last_name: checkout.billingAddress?.lastName,
+email: checkout.email,
+line_items: checkout.lineItems.map(item => ({
+  title, quantity, price, sku,
+  image_url: item.variant?.image?.url || "",
+  url: item.variant?.product?.url || "",
+}))
+```
+
+### What was NOT changed
+- All HubSpot create/update/search/segmentation logic — untouched
+- `generateCartHTML` — untouched
+- `reconcileOrderContact` — untouched
+
+---
+
 ## [2026-04-22] Fix cart HTML using pixel line_items instead of Admin API line_items
 
 **Branch:** `hubspot-new`
