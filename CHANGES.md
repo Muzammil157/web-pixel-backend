@@ -2,6 +2,55 @@
 
 ---
 
+## [2026-04-22] HubSpot visitor stitching via hubspotutk cookie + Forms API
+
+**Branch:** `hubspot-new`
+**File changed:** `index.js` only — 1 new function, 1 updated webhook handler
+
+### What this solves
+
+Without this, HubSpot contacts created via the CRM API show traffic source as
+"Offline Sources" with no page view history. With it, HubSpot retroactively
+attaches all anonymous browsing activity (pages visited, traffic source,
+referrer, sessions) to the contact the moment they abandon checkout.
+
+### How the hutk gets from browser to backend
+
+1. **theme.liquid** reads `hubspotutk` cookie (set by HubSpot tracking script)
+2. Saves it as a Shopify cart attribute via `/cart/update.js`
+3. Shopify carries the attribute through checkout
+4. It arrives as an entry in `note_attributes` on the `checkout/create` webhook payload
+5. Backend extracts it with `noteAttributes.find(attr => attr.name === "hubspotutk")`
+
+### `submitHubSpotForm(email, hutk)` — new function
+
+- POSTs to `https://api.hsforms.com/submissions/v3/integration/submit/5031174/e25d767c-f06c-4c65-99ad-ec3781d1dcd5`
+- No Authorization header — public endpoint
+- `email` sent in `fields` array with `objectTypeId: "0-1"` (Contact)
+- `hutk` added to `context` object only if present — omitted entirely if null
+- `pageUri`: `https://www.medical-and-lab-supplies.com/checkouts`
+- `pageName`: `"Checkout - Abandoned"`
+- Uses native `fetch` (Node 18+) — no axios
+- Full console logging at every step for server log monitoring
+
+### `/webhook/checkout-create` — updated
+
+Now extracts `email` and `hutk` from the payload and calls `submitHubSpotForm`.
+Existing `abandonedUrlMap` storage logic is untouched.
+
+| Scenario | Result |
+|---|---|
+| email + hutk present | Contact created/updated in HubSpot with full browsing history stitched |
+| email only, no hutk | Contact created/updated, traffic source shows as Offline Sources |
+| no email | Form submission skipped entirely |
+
+### What was NOT changed
+- `/checkout-completed` pixel endpoint — untouched
+- `reconcileOrderContact` — untouched
+- All segmentation flag logic — untouched
+
+---
+
 ## [2026-04-22] Remove deprecated Shopify Checkout API fetch — use pixel payload directly
 
 **Branch:** `hubspot-new`

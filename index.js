@@ -198,18 +198,47 @@ app.post("/connect-pixel", async (req, res) => {
 });
 
 app.post('/webhook/checkout-create', (req, res) => {
-  res.sendStatus(200); // respond fast to Shopify
+  res.sendStatus(200); // respond immediately — Shopify requires fast acknowledgement
 
   const checkout = req.body;
-  const token               = checkout.token || "";
+  const token              = checkout.token || "";
   const abandonedCheckoutUrl = checkout.abandoned_checkout_url || "";
+  const email              = (checkout.email || "").trim();
 
-  // console.log('[Shopify] checkout/create webhook received');
-  // console.log('[Shopify] abandoned_checkout_url:', abandonedCheckoutUrl);
+  console.log(`[Shopify] checkout/create received | token: ${token} | email: ${email || "MISSING"}`);
 
-  // Store the real recovery URL so /checkout-completed can use it when the pixel fires
+  // ── Store abandoned checkout URL for /checkout-completed to use later ──────
+  // When the pixel fires (checkout_contact_info_submitted), it looks up this URL
+  // by token so the real Shopify recovery link ends up on the HubSpot contact.
   if (token && abandonedCheckoutUrl) {
     abandonedUrlMap.set(token, abandonedCheckoutUrl);
+    console.log(`[Shopify] Stored abandoned_checkout_url for token: ${token}`);
+  } else {
+    console.log(`[Shopify] No abandoned_checkout_url to store | token: ${token || "MISSING"}`);
+  }
+
+  // ── Extract hubspotutk from note_attributes ──────────────────────────────
+  // theme.liquid reads the hubspotutk browser cookie and saves it as a Shopify
+  // cart attribute via /cart/update.js. Shopify passes cart attributes as
+  // note_attributes in the checkout/create webhook — that's how the browser
+  // cookie travels from the storefront to this backend.
+  const noteAttributes = Array.isArray(checkout.note_attributes) ? checkout.note_attributes : [];
+  const hutkAttr = noteAttributes.find(attr => attr.name === "hubspotutk");
+  const hutk = hutkAttr?.value || null;
+
+  console.log(`[HubSpot] hutk from note_attributes: ${hutk || "NOT FOUND — anonymous activity will not be stitched"}`);
+
+  // ── Submit to HubSpot Forms API ───────────────────────────────────────────
+  // This creates or updates the HubSpot contact and, if hutk is present,
+  // retroactively links all anonymous browsing history to that contact.
+  // Skipped entirely if email is missing — can't create a contact without it.
+  if (email) {
+    console.log(`[HubSpot Form] Triggering form submission for: ${email}`);
+    submitHubSpotForm(email, hutk).catch(err =>
+      console.error("[HubSpot Form] Unhandled error:", err.message)
+    );
+  } else {
+    console.log("[HubSpot Form] Skipping — no email in checkout payload");
   }
 });
 
@@ -370,6 +399,69 @@ app.post('/webhook/orders-create', async (req, res) => {
 //   }
 // });
 
+
+// ── HubSpot Forms API Submission ──────────────────────────────────────────
+// Submits the customer's email to a HubSpot form.
+//
+// The hutk parameter is the critical piece — it is the value of the
+// "hubspotutk" browser cookie that HubSpot's tracking script sets when a
+// visitor lands on any tracked page. By passing it here, HubSpot will
+// retroactively stitch ALL anonymous activity stored under that cookie
+// (page views, traffic source, sessions, referrer) onto the contact record.
+//
+// Without hutk → contact is created/updated but traffic source shows as
+//   "Offline Sources" and no page view history is attached.
+// With hutk    → HubSpot shows the real traffic source (Paid Search,
+//   Organic, Email, etc.) and full pre-checkout browsing history.
+//
+// theme.liquid reads the cookie and saves it as a Shopify cart attribute.
+// Shopify carries it through checkout and delivers it in note_attributes
+// on the checkout/create webhook payload — that's how it gets here.
+async function submitHubSpotForm(email, hutk) {
+  const PORTAL_ID = "5031174";
+  const FORM_ID   = "e25d767c-f06c-4c65-99ad-ec3781d1dcd5";
+  const url = `https://api.hsforms.com/submissions/v3/integration/submit/${PORTAL_ID}/${FORM_ID}`;
+
+  // Build the submission body
+  const body = {
+    fields: [
+      {
+        objectTypeId: "0-1", // 0-1 = Contact object in HubSpot
+        name: "email",
+        value: email,
+      },
+    ],
+    context: {
+      pageUri:  "https://www.medical-and-lab-supplies.com/checkouts",
+      pageName: "Checkout - Abandoned",
+    },
+  };
+
+  // Only attach hutk if it exists — passing null/undefined causes API errors
+  if (hutk) {
+    body.context.hutk = hutk;
+  }
+
+  console.log(`[HubSpot Form] Submitting | email: ${email} | hutk: ${hutk || "not present — traffic source will show as Offline Sources"}`);
+
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+
+    const data = await response.json();
+
+    if (!response.ok) {
+      console.error("[HubSpot Form] Submission FAILED | status:", response.status, "| response:", JSON.stringify(data));
+    } else {
+      console.log("[HubSpot Form] Submission SUCCESS | message:", data.inlineMessage || "OK");
+    }
+  } catch (err) {
+    console.error("[HubSpot Form] Network/fetch error:", err.message);
+  }
+}
 
 // ── Abandoned Cart HTML Helper ─────────────────────────────────────────────
 // Generates an email-safe, table-based HTML string from Shopify line items.
