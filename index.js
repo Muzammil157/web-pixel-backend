@@ -445,21 +445,14 @@ async function submitHubSpotForm(email, hutk) {
   console.log(`[HubSpot Form] Submitting | email: ${email} | hutk: ${hutk || "not present — traffic source will show as Offline Sources"}`);
 
   try {
-    const response = await fetch(url, {
-      method: "POST",
+    const response = await axios.post(url, body, {
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
     });
 
-    const data = await response.json();
-
-    if (!response.ok) {
-      console.error("[HubSpot Form] Submission FAILED | status:", response.status, "| response:", JSON.stringify(data));
-    } else {
-      console.log("[HubSpot Form] Submission SUCCESS | message:", data.inlineMessage || "OK");
-    }
+    console.log("[HubSpot Form] Submission SUCCESS | message:", response.data.inlineMessage || "OK");
   } catch (err) {
-    console.error("[HubSpot Form] Network/fetch error:", err.message);
+    const errData = err.response?.data || err.message;
+    console.error("[HubSpot Form] Submission FAILED:", JSON.stringify(errData));
   }
 }
 
