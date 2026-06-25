@@ -211,7 +211,7 @@ app.post('/webhook/checkout-create', (req, res) => {
   const abandonedCheckoutUrl = checkout.abandoned_checkout_url || "";
   const email              = (checkout.email || "").trim();
 
-  console.log(`[Shopify] checkout/create received | token: ${token} | email: ${email || "MISSING"}`);
+  console.log(`\n──────────── checkout/create | token: ${token} | email: ${email || "MISSING"} ────────────`);
 
   // ── Store abandoned checkout URL for /checkout-completed to use later ──────
   // When the pixel fires (checkout_contact_info_submitted), it looks up this URL
@@ -241,6 +241,7 @@ app.post('/webhook/checkout-create', (req, res) => {
   } else {
     console.log(`[HubSpot] hutk not found in note_attributes — visitor stitching will be skipped if cookie was blocked`);
   }
+  console.log(`──────────── checkout/create END | token: ${token} ────────────\n`);
 });
 
 app.post('/webhook/orders-create', async (req, res) => {
@@ -248,6 +249,8 @@ app.post('/webhook/orders-create', async (req, res) => {
 
   // Always respond fast to Shopify
   res.sendStatus(200);
+
+  console.log(`\n▓▓▓▓▓▓▓▓▓▓▓▓ ORDER: orders/create | order: ${order.id} | email: ${order.email || "MISSING"} ▓▓▓▓▓▓▓▓▓▓▓▓`);
 
   try {
     if (!order.customer) return;
@@ -304,6 +307,7 @@ app.post('/webhook/orders-create', async (req, res) => {
       console.error('[HubSpot] reconcileOrderContact error:', err.message)
     );
   }
+  console.log(`▓▓▓▓▓▓▓▓▓▓▓▓ ORDER END | order: ${order.id} ▓▓▓▓▓▓▓▓▓▓▓▓\n`);
 });
 
 
@@ -502,6 +506,8 @@ app.post("/checkout-completed", async (req, res) => {
     // ── Pixel payload is the sole source of truth (Shopify Checkout REST API is deprecated) ──
     const webhookToken = webhookCheckout.token || webhookCheckout.checkout_token || "";
     const firstName    = webhookCheckout.first_name || "";
+
+    console.log(`\n════════════ PIXEL: checkout_contact_info_submitted | token: ${webhookToken} ════════════`);
     const lastName     = webhookCheckout.last_name  || "";
     const email        = (webhookCheckout.email || "").trim();
 
@@ -640,6 +646,7 @@ app.post("/checkout-completed", async (req, res) => {
       console.error("[HubSpot Form] Unhandled error:", err.message)
     );
 
+    console.log(`════════════ PIXEL END | email: ${email} ════════════\n`);
     res.status(200).json({ success: true });
   } catch (err) {
     console.error("Error sending to HubSpot:", err.response?.data || err.message);
