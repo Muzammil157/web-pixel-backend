@@ -33,6 +33,12 @@ const checkoutTokenMap = new Map();
 // Consumed by /checkout-completed to set shopify_checkout_url on the HubSpot contact.
 const abandonedUrlMap = new Map();
 
+// HubSpot visitor cookie index: checkout_token → hutk
+// checkout/create fires before the customer enters their email, so we can't submit
+// the HubSpot form there. Instead we store the hutk here and look it up in
+// /checkout-completed (pixel) where the email is always available.
+const hutkMap = new Map();
+
 
 // Root route (optional)
 app.get("/", (req, res) => {
@@ -217,28 +223,23 @@ app.post('/webhook/checkout-create', (req, res) => {
     console.log(`[Shopify] No abandoned_checkout_url to store | token: ${token || "MISSING"}`);
   }
 
-  // ── Extract hubspotutk from note_attributes ──────────────────────────────
-  // theme.liquid reads the hubspotutk browser cookie and saves it as a Shopify
-  // cart attribute via /cart/update.js. Shopify passes cart attributes as
-  // note_attributes in the checkout/create webhook — that's how the browser
-  // cookie travels from the storefront to this backend.
+  // ── Extract hubspotutk from note_attributes and store by token ───────────
+  // theme.liquid saves the hubspotutk browser cookie as a Shopify cart
+  // attribute via /cart/update.js. Shopify carries it here as note_attributes.
+  //
+  // We DO NOT submit the HubSpot form here — checkout/create fires before the
+  // customer enters their email, so email is often missing at this point.
+  // Instead we store hutk by token so /checkout-completed (pixel) can look it
+  // up later when the email is guaranteed to be available.
   const noteAttributes = Array.isArray(checkout.note_attributes) ? checkout.note_attributes : [];
   const hutkAttr = noteAttributes.find(attr => attr.name === "hubspotutk");
   const hutk = hutkAttr?.value || null;
 
-  console.log(`[HubSpot] hutk from note_attributes: ${hutk || "NOT FOUND — anonymous activity will not be stitched"}`);
-
-  // ── Submit to HubSpot Forms API ───────────────────────────────────────────
-  // This creates or updates the HubSpot contact and, if hutk is present,
-  // retroactively links all anonymous browsing history to that contact.
-  // Skipped entirely if email is missing — can't create a contact without it.
-  if (email) {
-    console.log(`[HubSpot Form] Triggering form submission for: ${email}`);
-    submitHubSpotForm(email, hutk).catch(err =>
-      console.error("[HubSpot Form] Unhandled error:", err.message)
-    );
+  if (hutk && token) {
+    hutkMap.set(token, hutk);
+    console.log(`[HubSpot] hutk stored for token: ${token} → will be used when pixel fires with email`);
   } else {
-    console.log("[HubSpot Form] Skipping — no email in checkout payload");
+    console.log(`[HubSpot] hutk not found in note_attributes — visitor stitching will be skipped if cookie was blocked`);
   }
 });
 
@@ -628,6 +629,16 @@ app.post("/checkout-completed", async (req, res) => {
     if (checkoutToken) {
       checkoutTokenMap.set(checkoutToken, email);
     }
+
+    // ── HubSpot visitor stitching via Forms API ───────────────────────────────
+    // Now that we have the email (pixel always has it), look up the hutk that
+    // was stored by /webhook/checkout-create when the checkout was first created.
+    // Submitting here guarantees email + hutk are both available at the same time.
+    const hutk = hutkMap.get(checkoutToken) || null;
+    console.log(`[HubSpot Form] Pixel fired | email: ${email} | hutk: ${hutk || "not available — cookie was blocked or checkout/create fired without cart attributes"}`);
+    submitHubSpotForm(email, hutk).catch(err =>
+      console.error("[HubSpot Form] Unhandled error:", err.message)
+    );
 
     res.status(200).json({ success: true });
   } catch (err) {
