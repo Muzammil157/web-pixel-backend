@@ -637,11 +637,13 @@ app.post("/checkout-completed", async (req, res) => {
     }
 
     // ── HubSpot visitor stitching via Forms API ───────────────────────────────
-    // Now that we have the email (pixel always has it), look up the hutk that
-    // was stored by /webhook/checkout-create when the checkout was first created.
-    // Submitting here guarantees email + hutk are both available at the same time.
-    const hutk = hutkMap.get(checkoutToken) || null;
-    console.log(`[HubSpot Form] Pixel fired | email: ${email} | hutk: ${hutk || "not available — cookie was blocked or checkout/create fired without cart attributes"}`);
+    // hutk priority:
+    //   1. webhookCheckout.hutk — read directly by the pixel via browser.cookie.get()
+    //      Works for all checkout paths including Buy Now (no cart step needed).
+    //   2. hutkMap.get(token) — stored by /webhook/checkout-create from note_attributes
+    //      Fallback for cases where the pixel couldn't read the cookie.
+    const hutk = webhookCheckout.hutk || hutkMap.get(checkoutToken) || null;
+    console.log(`[HubSpot Form] Pixel fired | email: ${email} | hutk: ${hutk ? hutk : "not available — cookie blocked or incognito"}`);
     submitHubSpotForm(email, hutk).catch(err =>
       console.error("[HubSpot Form] Unhandled error:", err.message)
     );
