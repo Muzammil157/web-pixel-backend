@@ -2,6 +2,14 @@
 
 ---
 
+## [2026-08-12] Fix missing hutk for accelerated checkout customers
+
+**File changed:** `index.js`
+
+Added hutk fallback in `reconcileOrderContact` — after promoting a contact to CUSTOMER, checks `hutkMap` for a hutk stored by the `checkout/create` webhook. If found and the pixel didn't already fire (guarded via `checkoutTokenMap`), calls `submitHubSpotForm` with that hutk. Fixes visitor stitching for Shop Pay / Apple Pay / Google Pay customers who skip the pixel step.
+
+---
+
 ## [2026-08-12] Add debug logs to diagnose missing hutk tracking
 
 **File changed:** `index.js`

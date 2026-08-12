@@ -762,6 +762,29 @@ async function reconcileOrderContact(order) {
       timestamp: Date.now(),
     });
   }
+
+  // ── Visitor stitching fallback for accelerated checkout ───────────────────
+  // Shop Pay / Apple Pay / Google Pay skip checkout_contact_info_submitted,
+  // so the pixel never fires and submitHubSpotForm is never called.
+  // The checkout/create webhook already stored hutk in hutkMap — use it now.
+  //
+  // Guard: skip if checkoutTokenMap has this token, meaning the pixel already
+  // fired and submitted the form — avoids double submission.
+  if (resolvedEmail && order.checkout_token) {
+    if (checkoutTokenMap.has(order.checkout_token)) {
+      console.log(`[HubSpot Form] Order fallback skipped — pixel already submitted form for token: ${order.checkout_token}`);
+    } else {
+      const hutk = hutkMap.get(order.checkout_token) || null;
+      if (hutk) {
+        console.log(`[HubSpot Form] Order fallback | email: ${resolvedEmail} | hutk: ${hutk}`);
+        submitHubSpotForm(resolvedEmail, hutk).catch(err =>
+          console.error("[HubSpot Form] Order fallback error:", err.message)
+        );
+      } else {
+        console.log(`[HubSpot Form] Order fallback | email: ${resolvedEmail} | hutk: not in hutkMap — accelerated checkout without cart step or cookie blocked`);
+      }
+    }
+  }
 }
 
 const PORT = process.env.PORT || 3000;
