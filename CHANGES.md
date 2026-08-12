@@ -2,6 +2,18 @@
 
 ---
 
+## [2026-08-12] Add debug logs to diagnose missing hutk tracking
+
+**File changed:** `index.js`
+
+Added two debug log lines in `/checkout-completed` immediately after the pixel header log:
+- `[DEBUG] Pixel hutk from payload` — shows whether the pixel extension is sending hutk
+- `[DEBUG] hutkMap has token` — shows whether the `/webhook/checkout-create` fallback stored a hutk
+
+These logs are temporary diagnostics to confirm which hutk source (if any) is working.
+
+---
+
 ## [2026-04-22] HubSpot visitor stitching via hubspotutk cookie + Forms API
 
 **Branch:** `hubspot-new`

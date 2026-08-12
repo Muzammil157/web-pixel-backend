@@ -508,6 +508,8 @@ app.post("/checkout-completed", async (req, res) => {
     const firstName    = webhookCheckout.first_name || "";
 
     console.log(`\n════════════ PIXEL: checkout_contact_info_submitted | token: ${webhookToken} ════════════`);
+    console.log(`[DEBUG] Pixel hutk from payload: ${webhookCheckout.hutk || "MISSING"}`);
+    console.log(`[DEBUG] hutkMap has token: ${hutkMap.has(webhookToken)} | stored hutk: ${hutkMap.get(webhookToken) || "MISSING"}`);
     const lastName     = webhookCheckout.last_name  || "";
     const email        = (webhookCheckout.email || "").trim();
 
