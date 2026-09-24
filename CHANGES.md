@@ -2,6 +2,21 @@
 
 ---
 
+## [2026-09-24] Add retry logic for intermittent HubSpot 401/429 errors
+
+**File changed:** `index.js`
+
+HubSpot's search endpoint (`/crm/v3/objects/contacts/search`) has a 4 req/s rate limit and inconsistently returns 401 instead of 429 when that limit is hit. With no retry logic, a single rate-limit spike caused `reconcileOrderContact` to fail silently for that order — the search returned null (its own catch swallowed the 401), then the fallback create also got 401 and threw, surfacing as `reconcileOrderContact error: Request failed with status code 401`.
+
+Added one retry with a 1-second delay on 401 or 429 responses in three places:
+- `findHubSpotContactByEmail` — search endpoint
+- `reconcileOrderContact` PATCH path — update existing contact
+- `reconcileOrderContact` POST path — create new customer contact
+
+On the second attempt the rate-limit window has passed and the call succeeds. If the second attempt also fails (genuine auth error), the original error is re-thrown as before.
+
+---
+
 ## [2026-08-12] Fix missing hutk for accelerated checkout customers
 
 **File changed:** `index.js`
