@@ -660,25 +660,38 @@ app.post("/checkout-completed", async (req, res) => {
 
 // ── HubSpot Contact Search Helper ─────────────────────────────────────────
 // Returns the HubSpot contact object for a given email, or null if not found.
+// Retries once on 401/429 — HubSpot's search endpoint (4 req/s limit) can
+// return 401 instead of 429 when rate-limited.
 async function findHubSpotContactByEmail(email, hsHeaders) {
-  try {
-    const res = await axios.post(
-      "https://api.hubapi.com/crm/v3/objects/contacts/search",
-      {
-        filterGroups: [
-          { filters: [{ propertyName: "email", operator: "EQ", value: email }] },
-        ],
-        properties: ["email", "firstname", "lastname", "lifecyclestage",
-                     "shopify_has_order", "shopify_is_abandoned", "contact_attempted"],
-        limit: 1,
-      },
-      { headers: hsHeaders }
-    );
-    return res.data.results.length > 0 ? res.data.results[0] : null;
-  } catch (err) {
-    console.error(`[HubSpot] Search failed for email (${email}):`, err.message);
-    return null;
+  const body = {
+    filterGroups: [
+      { filters: [{ propertyName: "email", operator: "EQ", value: email }] },
+    ],
+    properties: ["email", "firstname", "lastname", "lifecyclestage",
+                 "shopify_has_order", "shopify_is_abandoned", "contact_attempted"],
+    limit: 1,
+  };
+
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const res = await axios.post(
+        "https://api.hubapi.com/crm/v3/objects/contacts/search",
+        body,
+        { headers: hsHeaders }
+      );
+      return res.data.results.length > 0 ? res.data.results[0] : null;
+    } catch (err) {
+      const status = err.response?.status;
+      if (attempt === 1 && (status === 401 || status === 429)) {
+        console.warn(`[HubSpot] Search attempt ${attempt} failed (${status}) for ${email} — retrying in 1s`);
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        continue;
+      }
+      console.error(`[HubSpot] Search failed for email (${email}):`, err.message);
+      return null;
+    }
   }
+  return null;
 }
 
 // ── HubSpot Order Reconciliation Helper ───────────────────────────────────
@@ -731,12 +744,25 @@ async function reconcileOrderContact(order) {
 
   if (contact) {
     // ── Contact found: promote to customer, always overwrite placeholder names ─
-    await axios.patch(
-      `https://api.hubapi.com/crm/v3/objects/contacts/${contact.id}`,
-      { properties: customerProps },
-      { headers: hsHeaders }
-    );
-    console.log(`[HubSpot] Contact ${contact.id} → CUSTOMER (order ${order.id})`);
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        await axios.patch(
+          `https://api.hubapi.com/crm/v3/objects/contacts/${contact.id}`,
+          { properties: customerProps },
+          { headers: hsHeaders }
+        );
+        console.log(`[HubSpot] Contact ${contact.id} → CUSTOMER (order ${order.id})`);
+        break;
+      } catch (err) {
+        const status = err.response?.status;
+        if (attempt === 1 && (status === 401 || status === 429)) {
+          console.warn(`[HubSpot] PATCH attempt ${attempt} failed (${status}) for contact ${contact.id} — retrying in 1s`);
+          await new Promise(resolve => setTimeout(resolve, 1000));
+          continue;
+        }
+        throw err;
+      }
+    }
   } else {
     // ── Last resort: create new customer contact ───────────────────────────────
     const emailToUse = resolvedEmail || order.billing_address?.email || "";
@@ -744,13 +770,26 @@ async function reconcileOrderContact(order) {
       console.warn(`[HubSpot] No email available for order ${order.id} — skipping`);
       return;
     }
-    const createRes = await axios.post(
-      "https://api.hubapi.com/crm/v3/objects/contacts",
-      { properties: { email: emailToUse, ...customerProps } },
-      { headers: hsHeaders }
-    );
-    console.log(`[HubSpot] New CUSTOMER contact created: ${createRes.data.id} (order ${order.id})`);
-    resolvedEmail = emailToUse;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        const createRes = await axios.post(
+          "https://api.hubapi.com/crm/v3/objects/contacts",
+          { properties: { email: emailToUse, ...customerProps } },
+          { headers: hsHeaders }
+        );
+        console.log(`[HubSpot] New CUSTOMER contact created: ${createRes.data.id} (order ${order.id})`);
+        resolvedEmail = emailToUse;
+        break;
+      } catch (err) {
+        const status = err.response?.status;
+        if (attempt === 1 && (status === 401 || status === 429)) {
+          console.warn(`[HubSpot] POST attempt ${attempt} failed (${status}) for ${emailToUse} — retrying in 1s`);
+          await new Promise(resolve => setTimeout(resolve, 1000));
+          continue;
+        }
+        throw err;
+      }
+    }
   }
 
   // Update reconciliation map — order is always the final truth
