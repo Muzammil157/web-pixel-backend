@@ -2,6 +2,24 @@
 
 ---
 
+## [2026-09-24] Fix hutk tracking for accelerated checkout customers
+
+**Files changed:** `index.js`, `../shopify-pixel/web-pixel/extensions/web-pixel-extension/src/index.js`
+
+### Problem
+Shop Pay / Apple Pay / Google Pay / Buy Now customers skip `checkout_contact_info_submitted`, so the pixel never fired and hutk was never sent to the backend. These customers ended up in HubSpot as "Offline Sources" with no page view history or form submission.
+
+### Fix
+
+**Pixel extension:** Added `checkout_started` subscriber. This event fires for ALL checkout paths including accelerated. It reads the `hubspotutk` cookie and POSTs `{ token, hutk }` to the new `/webhook/checkout-started` backend endpoint. Returns early if no token or hutk (incognito / cookie blocked).
+
+**Backend:** Added `/webhook/checkout-started` endpoint that stores the hutk in `hutkMap` by checkout token — the same map already read by `reconcileOrderContact` for the accelerated checkout fallback path. No other logic changed.
+
+### Result
+Accelerated checkout customers now have hutk in `hutkMap` before the order arrives. `reconcileOrderContact` finds it and calls `submitHubSpotForm` with the hutk → visitor session stitched → page views and traffic source appear in HubSpot.
+
+---
+
 ## [2026-09-24] Add retry logic for intermittent HubSpot 401/429 errors
 
 **File changed:** `index.js`

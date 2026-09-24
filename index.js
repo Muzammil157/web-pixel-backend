@@ -244,6 +244,19 @@ app.post('/webhook/checkout-create', (req, res) => {
   console.log(`──────────── checkout/create END | token: ${token} ────────────\n`);
 });
 
+// ── Pixel: checkout_started ────────────────────────────────────────────────
+// Fired by the web pixel for ALL checkout paths including accelerated checkout
+// (Shop Pay, Apple Pay, Google Pay, Buy Now). Stores hutk in hutkMap so
+// reconcileOrderContact can stitch the visitor session even when
+// checkout_contact_info_submitted is skipped entirely.
+app.post('/webhook/checkout-started', (req, res) => {
+  res.sendStatus(200);
+  const { token, hutk } = req.body;
+  if (!token || !hutk) return;
+  hutkMap.set(token, hutk);
+  console.log(`[HubSpot] checkout_started hutk stored for token: ${token}`);
+});
+
 app.post('/webhook/orders-create', async (req, res) => {
   const order = req.body;
 
