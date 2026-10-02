@@ -4,6 +4,29 @@ const express = require("express");
 const fetch = require("node-fetch");
 const axios = require("axios");
 const bodyParser = require("body-parser");
+const Database = require("better-sqlite3");
+
+// ── Persistent store ───────────────────────────────────────────────────────
+// hutkMap and checkoutTokenMap are persisted here so they survive restarts,
+// deploys, and Render sleep cycles. In-memory maps remain as a fast cache.
+const db = new Database(process.env.DB_PATH || "./payment_links.db");
+db.exec(`
+  CREATE TABLE IF NOT EXISTS hutk_store (
+    token      TEXT PRIMARY KEY,
+    hutk       TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS checkout_token_map (
+    token      TEXT PRIMARY KEY,
+    email      TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+  );
+`);
+const _dbSetHutk          = db.prepare("INSERT OR REPLACE INTO hutk_store (token, hutk, created_at) VALUES (?, ?, ?)");
+const _dbGetHutk          = db.prepare("SELECT hutk FROM hutk_store WHERE token = ?");
+const _dbSetCheckoutToken = db.prepare("INSERT OR REPLACE INTO checkout_token_map (token, email, created_at) VALUES (?, ?, ?)");
+const _dbGetCheckoutToken = db.prepare("SELECT email FROM checkout_token_map WHERE token = ?");
+const _dbHasCheckoutToken = db.prepare("SELECT 1 FROM checkout_token_map WHERE token = ?");
 
 const app = express();
 app.use(cors({
@@ -38,6 +61,16 @@ const abandonedUrlMap = new Map();
 // the HubSpot form there. Instead we store the hutk here and look it up in
 // /checkout-completed (pixel) where the email is always available.
 const hutkMap = new Map();
+
+// ── Seed in-memory maps from SQLite on startup ─────────────────────────────
+// Ensures hutk and checkout token data survives Render restarts and deploys.
+for (const row of db.prepare("SELECT token, hutk FROM hutk_store").all()) {
+  hutkMap.set(row.token, row.hutk);
+}
+for (const row of db.prepare("SELECT token, email FROM checkout_token_map").all()) {
+  checkoutTokenMap.set(row.token, row.email);
+}
+console.log(`[DB] Seeded ${hutkMap.size} hutk + ${checkoutTokenMap.size} checkout token entries from SQLite`);
 
 
 // Root route (optional)
@@ -237,6 +270,7 @@ app.post('/webhook/checkout-create', (req, res) => {
 
   if (hutk && token) {
     hutkMap.set(token, hutk);
+    _dbSetHutk.run(token, hutk, Date.now());
     console.log(`[HubSpot] hutk stored for token: ${token} → will be used when pixel fires with email`);
   } else {
     console.log(`[HubSpot] hutk not found in note_attributes — visitor stitching will be skipped if cookie was blocked`);
@@ -254,6 +288,7 @@ app.post('/webhook/checkout-started', (req, res) => {
   const { token, hutk } = req.body;
   if (!token || !hutk) return;
   hutkMap.set(token, hutk);
+  _dbSetHutk.run(token, hutk, Date.now());
   console.log(`[HubSpot] checkout_started hutk stored for token: ${token}`);
 });
 
@@ -265,58 +300,52 @@ app.post('/webhook/orders-create', async (req, res) => {
 
   console.log(`\n▓▓▓▓▓▓▓▓▓▓▓▓ ORDER: orders/create | order: ${order.id} | email: ${order.email || "MISSING"} ▓▓▓▓▓▓▓▓▓▓▓▓`);
 
-  try {
-    if (!order.customer) return;
+  // customerEmail: fallback when order.email is missing (common for accelerated checkout).
+  // The Shopify customer record almost always has an email even when the order payload doesn't.
+  let customerEmail = "";
 
-    const customerId = order.customer.id;
+  // ── B2B logic ─────────────────────────────────────────────────────────────
+  // Isolated in its own try/catch — never blocks HubSpot reconciliation below.
+  if (order.customer) {
+    try {
+      const customerId = order.customer.id;
 
-    // 🔹 Get customer from Shopify
-    const customerRes = await axios.get(
-      `https://medical-and-lab-supplies.myshopify.com/admin/api/2026-01/customers/${customerId}.json`,
-      {
-        headers: {
-          'X-Shopify-Access-Token': SHOPIFY_ACCESS_TOKEN
-        }
-      }
-    );
-
-    const tags = customerRes.data.customer.tags;
-
-    // 🔹 Check if B2B
-    if (tags && tags.includes('PROC_ACCT')) {
-
-      // 🔹 Update order with PO number
-      await axios.put(
-        `https://medical-and-lab-supplies.myshopify.com/admin/api/2026-01/orders/${order.id}.json`,
-        {
-          order: {
-            id: order.id,
-            po_number: "PROC_ACCT"
-          }
-        },
-        {
-          headers: {
-            'X-Shopify-Access-Token': SHOPIFY_ACCESS_TOKEN,
-            'Content-Type': 'application/json'
-          }
-        }
+      // 🔹 Get customer from Shopify
+      const customerRes = await axios.get(
+        `https://medical-and-lab-supplies.myshopify.com/admin/api/2026-01/customers/${customerId}.json`,
+        { headers: { 'X-Shopify-Access-Token': SHOPIFY_ACCESS_TOKEN } }
       );
 
-      console.log(`Order ${order.id} updated with B2B PO number`);
-    }
+      const shopifyCustomer = customerRes.data.customer;
 
-  } catch (err) {
-    console.error(
-      'Error:',
-      err.response?.data || err.message
-    );
+      // Capture email from Shopify customer record as fallback
+      customerEmail = (shopifyCustomer.email || "").trim().toLowerCase();
+
+      // 🔹 Check if B2B
+      if (shopifyCustomer.tags && shopifyCustomer.tags.includes('PROC_ACCT')) {
+        await axios.put(
+          `https://medical-and-lab-supplies.myshopify.com/admin/api/2026-01/orders/${order.id}.json`,
+          { order: { id: order.id, po_number: "PROC_ACCT" } },
+          {
+            headers: {
+              'X-Shopify-Access-Token': SHOPIFY_ACCESS_TOKEN,
+              'Content-Type': 'application/json'
+            }
+          }
+        );
+        console.log(`Order ${order.id} updated with B2B PO number`);
+      }
+
+    } catch (err) {
+      console.error('Error:', err.response?.data || err.message);
+    }
   }
 
   // ── HubSpot reconciliation: order = truth, promote to CUSTOMER ────────────
   // Runs after B2B logic. Isolated — any failure here never affects Shopify response.
-  // Fires when either email OR checkout_token is present — handles email-mismatch cases.
-  if (HUBSPOT_ACCESS_TOKEN && (order.email || order.checkout_token)) {
-    reconcileOrderContact(order).catch(err =>
+  // customerEmail fallback ensures orders with no email still get reconciled.
+  if (HUBSPOT_ACCESS_TOKEN && (order.email || order.checkout_token || customerEmail)) {
+    reconcileOrderContact(order, customerEmail).catch(err =>
       console.error('[HubSpot] reconcileOrderContact error:', err.message)
     );
   }
@@ -649,6 +678,7 @@ app.post("/checkout-completed", async (req, res) => {
     // Secondary index: token → email (survives email mismatch on order webhook)
     if (checkoutToken) {
       checkoutTokenMap.set(checkoutToken, email);
+      _dbSetCheckoutToken.run(checkoutToken, email, Date.now());
     }
 
     // ── HubSpot visitor stitching via Forms API ───────────────────────────────
@@ -713,7 +743,7 @@ async function findHubSpotContactByEmail(email, hsHeaders) {
 //   Step A — search HubSpot by order.email
 //   Step B — if Step A misses, bridge via order.checkout_token → checkoutTokenMap → email
 //   Last resort — create a new customer contact if no match at all
-async function reconcileOrderContact(order) {
+async function reconcileOrderContact(order, customerEmailFallback = "") {
   const hsHeaders = {
     Authorization: `Bearer ${HUBSPOT_ACCESS_TOKEN}`,
     "Content-Type": "application/json",
@@ -722,7 +752,12 @@ async function reconcileOrderContact(order) {
   // Order is the source of truth for real identity
   const firstname = order.customer?.first_name || order.billing_address?.first_name || "";
   const lastname  = order.customer?.last_name  || order.billing_address?.last_name  || "";
-  const orderEmail = (order.email || "").trim().toLowerCase();
+  // Use Shopify customer email as fallback when order.email is missing
+  // (common for accelerated checkout — Shop Pay, Apple Pay, Google Pay)
+  const orderEmail = (order.email || customerEmailFallback || "").trim().toLowerCase();
+  if (!order.email && customerEmailFallback) {
+    console.log(`[HubSpot] order.email missing for order ${order.id} — using Shopify customer email: ${customerEmailFallback}`);
+  }
 
   let contact      = null;
   let resolvedEmail = orderEmail;
