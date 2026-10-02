@@ -2,6 +2,26 @@
 
 ---
 
+## [2026-10-02] Persist hutkMap + checkoutTokenMap to SQLite; use Shopify customer email fallback
+
+**File changed:** `index.js`, `package.json`
+
+### Fix 1 — hutkMap and checkoutTokenMap now survive restarts
+
+Added `better-sqlite3` dependency. On startup, DB tables `hutk_store` and `checkout_token_map` are created if they don't exist, and the in-memory maps are seeded from them. Every `hutkMap.set()` and `checkoutTokenMap.set()` call now also writes to SQLite.
+
+Previously, a Render restart, deploy, or sleep cycle wiped both maps. An order arriving after restart would find nothing in `hutkMap` and log "not in hutkMap — accelerated checkout without cart step or cookie blocked" — even if hutk had been correctly stored before the restart.
+
+Affected write points: `checkout/create` webhook, `checkout-started` pixel endpoint, `checkout-completed` pixel endpoint.
+
+### Fix 2 — Use Shopify customer email when order.email is missing
+
+`reconcileOrderContact` now accepts a `customerEmailFallback` parameter. In `orders/create`, the Shopify customer record (already fetched for B2B tag check) provides an email that is passed as the fallback. Orders where `order.email` is missing but the customer record has one are now reconciled correctly.
+
+Also fixed: the `if (!order.customer) return` early exit previously skipped HubSpot reconciliation entirely for orders with no customer object. Restructured so B2B logic is skipped but HubSpot reconciliation still runs.
+
+---
+
 ## [2026-09-24] Fix hutk tracking for accelerated checkout customers
 
 **Files changed:** `index.js`, `../shopify-pixel/web-pixel/extensions/web-pixel-extension/src/index.js`
