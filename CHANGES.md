@@ -2,6 +2,26 @@
 
 ---
 
+## [2026-10-07] Read hutk from order.note_attributes; pixel always posts on checkout_started
+
+**Files changed:** `index.js`, `../shopify-pixel/web-pixel/extensions/web-pixel-extension/src/index.js`
+
+### Fix 1 — Order fallback reads `hubspotutk` from the order itself
+
+`reconcileOrderContact` now reads `hubspotutk` from `order.note_attributes` first and only then falls back to `hutkMap.get(order.checkout_token)`. The fallback no longer requires `order.checkout_token`.
+
+Previously, draft orders (Wholesale Pricing Discount app) carried the cookie on the order but their checkout token was never in `hutkMap`, so the log said "not in hutkMap" and no form was submitted (e.g. order 7370482155838 on 2026-10-07). The log line now also shows which source the hutk came from.
+
+### Fix 2 — `checkout_started` is always posted and always logged
+
+**Pixel extension:** the `checkout_started` subscriber no longer returns early when the cookie is missing; it posts `{ token, hutk: null }`.
+
+**Backend:** `/webhook/checkout-started` logs `hutk: MISSING` for those posts instead of dropping them silently. Nothing is stored when hutk is missing.
+
+This makes it possible to tell "pixel never ran" from "pixel ran but found no cookie" on express checkouts (Shop Pay etc.), which the logs could not distinguish before.
+
+---
+
 ## [2026-10-02] Persist hutkMap + checkoutTokenMap to SQLite; use Shopify customer email fallback
 
 **File changed:** `index.js`, `package.json`

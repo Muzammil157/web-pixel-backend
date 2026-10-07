@@ -286,7 +286,13 @@ app.post('/webhook/checkout-create', (req, res) => {
 app.post('/webhook/checkout-started', (req, res) => {
   res.sendStatus(200);
   const { token, hutk } = req.body;
-  if (!token || !hutk) return;
+  if (!token) return;
+  // The pixel now posts on every checkout_started, with or without a cookie,
+  // so the logs show whether the pixel ran at all (e.g. on express checkouts).
+  if (!hutk) {
+    console.log(`[HubSpot] checkout_started received for token: ${token} | hutk: MISSING — pixel ran but found no hubspotutk cookie`);
+    return;
+  }
   hutkMap.set(token, hutk);
   _dbSetHutk.run(token, hutk, Date.now());
   console.log(`[HubSpot] checkout_started hutk stored for token: ${token}`);
@@ -857,18 +863,29 @@ async function reconcileOrderContact(order, customerEmailFallback = "") {
   //
   // Guard: skip if checkoutTokenMap has this token, meaning the pixel already
   // fired and submitted the form — avoids double submission.
-  if (resolvedEmail && order.checkout_token) {
-    if (checkoutTokenMap.has(order.checkout_token)) {
+  //
+  // hutk priority:
+  //   1. order.note_attributes.hubspotutk — the cart attribute saved by
+  //      theme.liquid, carried on the order itself. Works for draft orders
+  //      (e.g. Wholesale Pricing Discount) whose checkout token never reaches
+  //      hutkMap, and survives server restarts.
+  //   2. hutkMap.get(order.checkout_token) — stored by /webhook/checkout-create
+  //      or the pixel's checkout_started event.
+  if (resolvedEmail) {
+    if (order.checkout_token && checkoutTokenMap.has(order.checkout_token)) {
       console.log(`[HubSpot Form] Order fallback skipped — pixel already submitted form for token: ${order.checkout_token}`);
     } else {
-      const hutk = hutkMap.get(order.checkout_token) || null;
+      const orderNoteAttributes = Array.isArray(order.note_attributes) ? order.note_attributes : [];
+      const orderHutk = orderNoteAttributes.find(attr => attr.name === "hubspotutk")?.value || null;
+      const mapHutk   = order.checkout_token ? (hutkMap.get(order.checkout_token) || null) : null;
+      const hutk      = orderHutk || mapHutk;
       if (hutk) {
-        console.log(`[HubSpot Form] Order fallback | email: ${resolvedEmail} | hutk: ${hutk}`);
+        console.log(`[HubSpot Form] Order fallback | email: ${resolvedEmail} | hutk: ${hutk} | source: ${orderHutk ? "order.note_attributes" : "hutkMap"}`);
         submitHubSpotForm(resolvedEmail, hutk).catch(err =>
           console.error("[HubSpot Form] Order fallback error:", err.message)
         );
       } else {
-        console.log(`[HubSpot Form] Order fallback | email: ${resolvedEmail} | hutk: not in hutkMap — accelerated checkout without cart step or cookie blocked`);
+        console.log(`[HubSpot Form] Order fallback | email: ${resolvedEmail} | hutk: not on order.note_attributes or in hutkMap — accelerated checkout without cart step or cookie blocked`);
       }
     }
   }
