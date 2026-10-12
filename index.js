@@ -21,12 +21,24 @@ db.exec(`
     email      TEXT NOT NULL,
     created_at INTEGER NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS attribution_queue (
+    order_id   TEXT PRIMARY KEY,
+    order_gid  TEXT NOT NULL,
+    contact_id TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    attempts   INTEGER NOT NULL DEFAULT 0
+  );
 `);
 const _dbSetHutk          = db.prepare("INSERT OR REPLACE INTO hutk_store (token, hutk, created_at) VALUES (?, ?, ?)");
 const _dbGetHutk          = db.prepare("SELECT hutk FROM hutk_store WHERE token = ?");
 const _dbSetCheckoutToken = db.prepare("INSERT OR REPLACE INTO checkout_token_map (token, email, created_at) VALUES (?, ?, ?)");
 const _dbGetCheckoutToken = db.prepare("SELECT email FROM checkout_token_map WHERE token = ?");
 const _dbHasCheckoutToken = db.prepare("SELECT 1 FROM checkout_token_map WHERE token = ?");
+// Orders whose Shopify customer journey wasn't ready yet — retried by the sweep.
+const _dbQueueAttribution  = db.prepare("INSERT OR IGNORE INTO attribution_queue (order_id, order_gid, contact_id, created_at, attempts) VALUES (?, ?, ?, ?, 1)");
+const _dbPendingAttribution = db.prepare("SELECT order_id, order_gid, contact_id, created_at, attempts FROM attribution_queue ORDER BY created_at");
+const _dbBumpAttribution   = db.prepare("UPDATE attribution_queue SET attempts = attempts + 1 WHERE order_id = ?");
+const _dbDoneAttribution   = db.prepare("DELETE FROM attribution_queue WHERE order_id = ?");
 
 const app = express();
 app.use(cors({
@@ -1055,32 +1067,71 @@ async function ensureAttributionProperties() {
   }
 }
 
-// Shopify builds the customer journey asynchronously, so it is often not ready
-// the moment orders/create fires. Try now, then after 1 and 5 minutes.
+// Shopify builds the customer journey asynchronously and it can take well over
+// 5 minutes (observed 2026-10-12). Try once right away; if it isn't ready,
+// park the order in the SQLite attribution_queue. A sweep every 10 minutes
+// retries queued orders for up to 24 hours. The queue lives in SQLite, so it
+// survives Render restarts and deploys.
+const ATTRIBUTION_SWEEP_MS   = Number(process.env.ATTRIBUTION_SWEEP_MS) || 10 * 60 * 1000;
+const ATTRIBUTION_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
 function scheduleShopifyAttribution(order, contactId) {
-  const delays = [0, 60 * 1000, 5 * 60 * 1000];
-  const attempt = async (i) => {
-    let done = false;
-    try {
-      done = await applyShopifyAttribution(order, contactId);
-    } catch (err) {
-      console.error(`[Attribution] Error for order ${order.id}:`, err.response?.data?.message || err.message);
-      done = true; // don't retry on hard errors
-    }
-    if (done) return;
-    if (i + 1 < delays.length) {
-      setTimeout(() => attempt(i + 1), delays[i + 1]);
-    } else {
-      console.log(`[Attribution] Gave up on order ${order.id} — Shopify journey never became ready`);
-    }
+  const job = {
+    orderId:   String(order.id),
+    orderGid:  order.admin_graphql_api_id || `gid://shopify/Order/${order.id}`,
+    contactId: String(contactId),
   };
-  attempt(0);
+  runAttributionJob(job).then(done => {
+    if (done) return;
+    _dbQueueAttribution.run(job.orderId, job.orderGid, job.contactId, Date.now());
+    console.log(`[Attribution] Order ${job.orderId} queued — will retry every ${Math.round(ATTRIBUTION_SWEEP_MS / 60000)} min for up to 24h`);
+  });
+}
+
+// Returns true when finished, false when it should be retried later.
+async function runAttributionJob(job) {
+  try {
+    return await applyShopifyAttribution(job);
+  } catch (err) {
+    const status = err.response?.status;
+    // Network errors, rate limits and server errors are worth retrying
+    if (!status || status === 429 || status >= 500) {
+      console.warn(`[Attribution] Temporary error for order ${job.orderId} (${status || err.code || err.message}) — will retry`);
+      return false;
+    }
+    console.error(`[Attribution] Error for order ${job.orderId}:`, err.response?.data?.message || err.message);
+    return true;
+  }
+}
+
+let attributionSweepRunning = false;
+async function sweepAttributionQueue() {
+  if (attributionSweepRunning) return;
+  attributionSweepRunning = true;
+  try {
+    const rows = _dbPendingAttribution.all();
+    if (rows.length) console.log(`[Attribution] Sweep: ${rows.length} queued order(s)`);
+    for (const row of rows) {
+      if (Date.now() - row.created_at > ATTRIBUTION_MAX_AGE_MS) {
+        _dbDoneAttribution.run(row.order_id);
+        console.log(`[Attribution] Gave up on order ${row.order_id} after 24h (${row.attempts} attempts) — Shopify journey never became ready`);
+        continue;
+      }
+      const done = await runAttributionJob({ orderId: row.order_id, orderGid: row.order_gid, contactId: row.contact_id });
+      if (done) _dbDoneAttribution.run(row.order_id);
+      else _dbBumpAttribution.run(row.order_id);
+    }
+  } catch (err) {
+    console.error("[Attribution] Sweep failed:", err.message);
+  } finally {
+    attributionSweepRunning = false;
+  }
 }
 
 // Returns true when finished (written or nothing to write), false to retry later.
-async function applyShopifyAttribution(order, contactId) {
+async function applyShopifyAttribution(job) {
   const shop = process.env.SHOPIFY_SHOP_DOMAIN || "medical-and-lab-supplies.myshopify.com";
-  const orderGid = order.admin_graphql_api_id || `gid://shopify/Order/${order.id}`;
+  const { orderId, orderGid, contactId } = job;
 
   const gqlRes = await axios.post(
     `https://${shop}/admin/api/2026-01/graphql.json`,
@@ -1110,7 +1161,7 @@ async function applyShopifyAttribution(order, contactId) {
   );
 
   if (gqlRes.data.errors) {
-    console.error(`[Attribution] Shopify GraphQL error for order ${order.id}:`, JSON.stringify(gqlRes.data.errors));
+    console.error(`[Attribution] Shopify GraphQL error for order ${orderId}:`, JSON.stringify(gqlRes.data.errors));
     return true;
   }
 
@@ -1118,11 +1169,11 @@ async function applyShopifyAttribution(order, contactId) {
   const journey = shopifyOrder?.customerJourneySummary;
   if (!journey) {
     // Draft orders, POS and API-created orders have no online-store journey.
-    console.log(`[Attribution] No customer journey for order ${order.id} (draft/POS/API order) — nothing to write`);
+    console.log(`[Attribution] No customer journey for order ${orderId} (draft/POS/API order) — nothing to write`);
     return true;
   }
   if (!journey.ready) {
-    console.log(`[Attribution] Journey not ready yet for order ${order.id} — will retry`);
+    console.log(`[Attribution] Journey not ready yet for order ${orderId}`);
     return false;
   }
 
@@ -1164,6 +1215,31 @@ async function applyShopifyAttribution(order, contactId) {
 ensureAttributionProperties().catch(err =>
   console.error("[Attribution] Property check failed:", err.message)
 );
+
+// ── One-time backfill (2026-10-12) ─────────────────────────────────────────
+// Orders placed after the first attribution release, whose attribution was
+// dropped by the old 5-minute retry. Seeded into the queue on startup until
+// 2026-10-14; re-writing the same values on a restart is harmless.
+// Safe to delete this block after 2026-10-14.
+const ATTRIBUTION_BACKFILL = [
+  // [order id,       HubSpot contact id]   order   / contact
+  ["7378605408574", "254501290096"],    // #398793 / Shane Spurlock (phone-only)
+  ["7378606948670", "53468051"],        // #398794 / sambay818@yahoo.com
+  ["7378664915262", "254504597810"],    // #398795 / kylep@lenz-tx.com
+  ["7378714984766", "122625386408"],    // #398796 / aidanye@gmail.com
+  ["7378719670590", "102211417870"],    // #398797 / k3vinsanch0@gmail.com
+];
+if (Date.now() < Date.parse("2026-10-14T00:00:00Z")) {
+  for (const [orderId, contactId] of ATTRIBUTION_BACKFILL) {
+    _dbQueueAttribution.run(orderId, `gid://shopify/Order/${orderId}`, contactId, Date.now());
+  }
+  console.log(`[Attribution] Backfill: ${ATTRIBUTION_BACKFILL.length} order(s) seeded into the queue`);
+}
+
+// Retry queued attribution every 10 minutes; first sweep 1 minute after start
+// so orders queued before a restart are picked up promptly.
+setTimeout(sweepAttributionQueue, 60 * 1000);
+setInterval(sweepAttributionQueue, ATTRIBUTION_SWEEP_MS);
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
