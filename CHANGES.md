@@ -2,6 +2,52 @@
 
 ---
 
+## [2026-10-12, later] Attribution retries moved to a persistent 24-hour queue
+
+**File changed:** `index.js`
+
+### Problem
+The first attribution release retried for only 5 minutes. On 2026-10-12 every order after the deploy logged "Gave up … Shopify journey never became ready", yet the journeys were ready when checked 30–80 minutes later (#398793, #398794, #398795). No contact got attribution.
+
+### Fix
+- `scheduleShopifyAttribution` tries once immediately. If the journey isn't ready, the order goes into a new SQLite table, `attribution_queue`.
+- `sweepAttributionQueue` runs every 10 minutes (first run 1 minute after start) and retries queued orders for up to 24 hours, then drops them with a "Gave up after 24h" log.
+- The queue is in SQLite, so it survives Render restarts and deploys.
+- Network errors, 429s and 5xx from Shopify are now retried; other errors are logged and dropped.
+- `ATTRIBUTION_SWEEP_MS` env var can override the 10-minute interval.
+
+### Backfill
+The 5 orders placed between the first attribution release and this one (#398793–#398797) are seeded into the queue on startup by the `ATTRIBUTION_BACKFILL` block, until 2026-10-14. The block can be deleted after that date.
+
+---
+
+## [2026-10-12] Shopify attribution fallback, 409-safe contact creation, phone-only contacts
+
+**File changed:** `index.js`
+
+### Fix 1 — Shopify attribution written to every order's contact
+
+Express Shop Pay checkouts never touch the store's checkout pages, so neither the pixel nor the `checkout/create` webhook sees them and no `hubspotutk` exists (confirmed in logs for orders #398741, #398742, #398744, #398757, #398761, #398762 on 2026-10-11). Shopify still records where those buyers came from.
+
+After every order is reconciled, `scheduleShopifyAttribution` reads the order's `customerJourneySummary` from the Shopify Admin GraphQL API and writes it to these custom contact properties: `shopify_source`, `shopify_utm_source`, `shopify_utm_medium`, `shopify_utm_campaign`, `shopify_referrer_url`, `shopify_first_landing_page`, `shopify_last_landing_page`, `shopify_sessions_before_order`, `shopify_days_to_conversion`, `shopify_attribution_order`.
+
+- Runs for all orders, not just cookie-less ones, and never touches HubSpot's own analytics fields (page views, Original Source).
+- The journey is often not ready when `orders/create` fires, so it retries after 1 and 5 minutes.
+- Draft/POS orders have no journey and are skipped.
+- `ensureAttributionProperties()` creates any missing properties at startup. This needs the `crm.schemas.contacts.write` scope on the HubSpot private app; without it, the log lists the properties to create by hand.
+
+### Fix 2 — 409 when HubSpot's native Shopify app creates the contact first
+
+`reconcileOrderContact` searched, found nothing, then tried to create the contact — but the native app had created it in the meantime. HubSpot returned 409, the error was thrown and the contact was never promoted to customer (order 7377788666174 on 2026-10-12). `createHubSpotContact` now reads the existing ID from the 409 message and updates that contact instead.
+
+### Fix 3 — Phone-only checkouts
+
+Orders with no email on the order or the Shopify customer were skipped entirely ("No email available … skipping"), so those buyers never reached HubSpot (e.g. #398784, #398785). They are now matched by phone (`phone` / `mobilephone`, E.164) or created as phone-only customer contacts. The hubspotutk cookie still can't be attached without an email, but Shopify attribution is written.
+
+Note: HubSpot dedupes contacts by email, not phone, so a phone-only buyer who later checks out with an email will create a second contact that needs a manual merge.
+
+---
+
 ## [2026-10-07] Read hutk from order.note_attributes; pixel always posts on checkout_started
 
 **Files changed:** `index.js`, `../shopify-pixel/web-pixel/extensions/web-pixel-extension/src/index.js`
