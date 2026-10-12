@@ -309,6 +309,8 @@ app.post('/webhook/orders-create', async (req, res) => {
   // customerEmail: fallback when order.email is missing (common for accelerated checkout).
   // The Shopify customer record almost always has an email even when the order payload doesn't.
   let customerEmail = "";
+  // customerPhone: fallback identity for phone-only checkouts (no email anywhere).
+  let customerPhone = "";
 
   // ── B2B logic ─────────────────────────────────────────────────────────────
   // Isolated in its own try/catch — never blocks HubSpot reconciliation below.
@@ -326,6 +328,7 @@ app.post('/webhook/orders-create', async (req, res) => {
 
       // Capture email from Shopify customer record as fallback
       customerEmail = (shopifyCustomer.email || "").trim().toLowerCase();
+      customerPhone = (shopifyCustomer.phone || "").trim();
 
       // 🔹 Check if B2B
       if (shopifyCustomer.tags && shopifyCustomer.tags.includes('PROC_ACCT')) {
@@ -350,10 +353,19 @@ app.post('/webhook/orders-create', async (req, res) => {
   // ── HubSpot reconciliation: order = truth, promote to CUSTOMER ────────────
   // Runs after B2B logic. Isolated — any failure here never affects Shopify response.
   // customerEmail fallback ensures orders with no email still get reconciled.
-  if (HUBSPOT_ACCESS_TOKEN && (order.email || order.checkout_token || customerEmail)) {
-    reconcileOrderContact(order, customerEmail).catch(err =>
-      console.error('[HubSpot] reconcileOrderContact error:', err.message)
-    );
+  // customerPhone fallback lets phone-only checkouts reach HubSpot too.
+  // After the contact is resolved, Shopify's own attribution (source, UTM,
+  // landing pages) is written to it — this works even when no hutk exists.
+  const hasIdentity = order.email || order.checkout_token || customerEmail
+                   || order.phone || customerPhone;
+  if (HUBSPOT_ACCESS_TOKEN && hasIdentity) {
+    reconcileOrderContact(order, customerEmail, customerPhone)
+      .then(contactId => {
+        if (contactId) scheduleShopifyAttribution(order, contactId);
+      })
+      .catch(err =>
+        console.error('[HubSpot] reconcileOrderContact error:', err.response?.data?.message || err.message)
+      );
   }
   console.log(`▓▓▓▓▓▓▓▓▓▓▓▓ ORDER END | order: ${order.id} ▓▓▓▓▓▓▓▓▓▓▓▓\n`);
 });
@@ -743,13 +755,105 @@ async function findHubSpotContactByEmail(email, hsHeaders) {
   return null;
 }
 
+// ── Phone helpers (phone-only checkouts) ──────────────────────────────────
+// Shopify lets buyers check out with a phone number instead of an email.
+// Those orders arrive with no email anywhere, so they are matched by phone.
+function normalizePhone(raw) {
+  if (!raw) return "";
+  const trimmed = String(raw).trim();
+  const digits  = trimmed.replace(/\D/g, "");
+  if (!digits) return "";
+  if (trimmed.startsWith("+")) return `+${digits}`;
+  if (digits.length === 10) return `+1${digits}`;   // US/CA number without country code
+  return `+${digits}`;
+}
+
+async function findHubSpotContactByPhone(phone, hsHeaders) {
+  try {
+    const res = await axios.post(
+      "https://api.hubapi.com/crm/v3/objects/contacts/search",
+      {
+        filterGroups: [
+          { filters: [{ propertyName: "phone",       operator: "EQ", value: phone }] },
+          { filters: [{ propertyName: "mobilephone", operator: "EQ", value: phone }] },
+        ],
+        properties: ["email", "phone", "firstname", "lastname", "lifecyclestage"],
+        limit: 1,
+      },
+      { headers: hsHeaders }
+    );
+    return res.data.results.length > 0 ? res.data.results[0] : null;
+  } catch (err) {
+    console.error(`[HubSpot] Search failed for phone (${phone}):`, err.message);
+    return null;
+  }
+}
+
+// ── HubSpot write helpers ─────────────────────────────────────────────────
+// Both retry once on 401/429 — HubSpot can return 401 instead of 429 when rate-limited.
+async function patchHubSpotContact(contactId, properties, hsHeaders) {
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      await axios.patch(
+        `https://api.hubapi.com/crm/v3/objects/contacts/${contactId}`,
+        { properties },
+        { headers: hsHeaders }
+      );
+      return;
+    } catch (err) {
+      const status = err.response?.status;
+      if (attempt === 1 && (status === 401 || status === 429)) {
+        console.warn(`[HubSpot] PATCH attempt ${attempt} failed (${status}) for contact ${contactId} — retrying in 1s`);
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
+// Creates a contact. On 409 (the contact was created in the meantime — usually
+// by HubSpot's native Shopify app racing us on the same order) it reads the
+// existing ID from the error and updates that contact instead.
+// Returns { id, existed }.
+async function createHubSpotContact(properties, hsHeaders, label) {
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const res = await axios.post(
+        "https://api.hubapi.com/crm/v3/objects/contacts",
+        { properties },
+        { headers: hsHeaders }
+      );
+      return { id: res.data.id, existed: false };
+    } catch (err) {
+      const status = err.response?.status;
+      if (status === 409) {
+        const match = String(err.response?.data?.message || "").match(/Existing ID:\s*(\d+)/i);
+        if (match) {
+          console.log(`[HubSpot] Contact already exists for ${label} (409) — updating existing contact ${match[1]} instead`);
+          await patchHubSpotContact(match[1], properties, hsHeaders);
+          return { id: match[1], existed: true };
+        }
+      }
+      if (attempt === 1 && (status === 401 || status === 429)) {
+        console.warn(`[HubSpot] POST attempt ${attempt} failed (${status}) for ${label} — retrying in 1s`);
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
 // ── HubSpot Order Reconciliation Helper ───────────────────────────────────
 // Called after every orders/create webhook.
 // Matching strategy (in order):
 //   Step A — search HubSpot by order.email
 //   Step B — if Step A misses, bridge via order.checkout_token → checkoutTokenMap → email
 //   Last resort — create a new customer contact if no match at all
-async function reconcileOrderContact(order, customerEmailFallback = "") {
+//   Phone-only — no email anywhere: match or create the contact by phone
+// Returns the HubSpot contact ID (or null) so Shopify attribution can be written to it.
+async function reconcileOrderContact(order, customerEmailFallback = "", customerPhoneFallback = "") {
   const hsHeaders = {
     Authorization: `Bearer ${HUBSPOT_ACCESS_TOKEN}`,
     "Content-Type": "application/json",
@@ -796,53 +900,45 @@ async function reconcileOrderContact(order, customerEmailFallback = "") {
   if (firstname) customerProps.firstname = firstname;
   if (lastname)  customerProps.lastname  = lastname;
 
+  let contactId = null;
+
   if (contact) {
     // ── Contact found: promote to customer, always overwrite placeholder names ─
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      try {
-        await axios.patch(
-          `https://api.hubapi.com/crm/v3/objects/contacts/${contact.id}`,
-          { properties: customerProps },
-          { headers: hsHeaders }
-        );
-        console.log(`[HubSpot] Contact ${contact.id} → CUSTOMER (order ${order.id})`);
-        break;
-      } catch (err) {
-        const status = err.response?.status;
-        if (attempt === 1 && (status === 401 || status === 429)) {
-          console.warn(`[HubSpot] PATCH attempt ${attempt} failed (${status}) for contact ${contact.id} — retrying in 1s`);
-          await new Promise(resolve => setTimeout(resolve, 1000));
-          continue;
-        }
-        throw err;
-      }
-    }
+    await patchHubSpotContact(contact.id, customerProps, hsHeaders);
+    contactId = contact.id;
+    console.log(`[HubSpot] Contact ${contact.id} → CUSTOMER (order ${order.id})`);
   } else {
-    // ── Last resort: create new customer contact ───────────────────────────────
     const emailToUse = resolvedEmail || order.billing_address?.email || "";
-    if (!emailToUse) {
-      console.warn(`[HubSpot] No email available for order ${order.id} — skipping`);
-      return;
-    }
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      try {
-        const createRes = await axios.post(
-          "https://api.hubapi.com/crm/v3/objects/contacts",
-          { properties: { email: emailToUse, ...customerProps } },
-          { headers: hsHeaders }
-        );
-        console.log(`[HubSpot] New CUSTOMER contact created: ${createRes.data.id} (order ${order.id})`);
-        resolvedEmail = emailToUse;
-        break;
-      } catch (err) {
-        const status = err.response?.status;
-        if (attempt === 1 && (status === 401 || status === 429)) {
-          console.warn(`[HubSpot] POST attempt ${attempt} failed (${status}) for ${emailToUse} — retrying in 1s`);
-          await new Promise(resolve => setTimeout(resolve, 1000));
-          continue;
-        }
-        throw err;
+    if (emailToUse) {
+      // ── Last resort: create new customer contact (409-safe) ─────────────────
+      const created = await createHubSpotContact({ email: emailToUse, ...customerProps }, hsHeaders, emailToUse);
+      contactId = created.id;
+      resolvedEmail = emailToUse;
+      console.log(created.existed
+        ? `[HubSpot] Contact ${contactId} → CUSTOMER (order ${order.id}) — after 409`
+        : `[HubSpot] New CUSTOMER contact created: ${contactId} (order ${order.id})`);
+    } else {
+      // ── Phone-only checkout: no email on order or customer ─────────────────
+      const phone = normalizePhone(
+        order.phone || customerPhoneFallback || order.customer?.phone ||
+        order.billing_address?.phone || order.shipping_address?.phone
+      );
+      if (!phone) {
+        console.warn(`[HubSpot] No email or phone available for order ${order.id} — skipping`);
+        return null;
       }
+      const phoneProps = { phone, ...customerProps };
+      const existing = await findHubSpotContactByPhone(phone, hsHeaders);
+      if (existing) {
+        await patchHubSpotContact(existing.id, customerProps, hsHeaders);
+        contactId = existing.id;
+        console.log(`[HubSpot] Phone-only order ${order.id} — matched contact ${contactId} by phone ${phone} → CUSTOMER`);
+      } else {
+        const created = await createHubSpotContact(phoneProps, hsHeaders, phone);
+        contactId = created.id;
+        console.log(`[HubSpot] Phone-only order ${order.id} — CUSTOMER contact ${created.existed ? "updated" : "created"}: ${contactId} (phone ${phone})`);
+      }
+      console.log(`[HubSpot Form] Phone-only order ${order.id} — no email, so the hubspotutk cookie can't be attached (Shopify attribution will still be written)`);
     }
   }
 
@@ -889,7 +985,185 @@ async function reconcileOrderContact(order, customerEmailFallback = "") {
       }
     }
   }
+
+  return contactId;
 }
+
+// ── Shopify attribution → HubSpot ─────────────────────────────────────────
+// Shopify records where every buyer came from (source, UTM, landing pages) on
+// the order's customer journey — including Shop Pay express checkouts that our
+// pixel and the hubspotutk cookie never see. These are written to custom
+// contact properties on EVERY order, separate from HubSpot's own analytics
+// fields, so they never conflict with page views or Original Source.
+// Values reflect the most recent order (Shopify's journey covers the sessions
+// since the customer's previous order, within a 30-day window).
+const SHOPIFY_ATTRIBUTION_PROPERTIES = [
+  { name: "shopify_source",              label: "Shopify Source (latest order)",              type: "string", fieldType: "text"   },
+  { name: "shopify_utm_source",          label: "Shopify UTM Source (latest order)",          type: "string", fieldType: "text"   },
+  { name: "shopify_utm_medium",          label: "Shopify UTM Medium (latest order)",          type: "string", fieldType: "text"   },
+  { name: "shopify_utm_campaign",        label: "Shopify UTM Campaign (latest order)",        type: "string", fieldType: "text"   },
+  { name: "shopify_referrer_url",        label: "Shopify Referrer URL (latest order)",        type: "string", fieldType: "text"   },
+  { name: "shopify_first_landing_page",  label: "Shopify First Landing Page (latest order)",  type: "string", fieldType: "text"   },
+  { name: "shopify_last_landing_page",   label: "Shopify Last Landing Page (latest order)",   type: "string", fieldType: "text"   },
+  { name: "shopify_sessions_before_order", label: "Shopify Sessions Before Order (latest order)", type: "number", fieldType: "number" },
+  { name: "shopify_days_to_conversion",  label: "Shopify Days to Conversion (latest order)",  type: "number", fieldType: "number" },
+  { name: "shopify_attribution_order",   label: "Shopify Attribution Order",                  type: "string", fieldType: "text"   },
+];
+
+// Creates any missing attribution properties at startup.
+// Needs the crm.schemas.contacts.write scope on the HubSpot private app;
+// without it, the properties must be created by hand in HubSpot.
+async function ensureAttributionProperties() {
+  if (!HUBSPOT_ACCESS_TOKEN) return;
+  const hsHeaders = { Authorization: `Bearer ${HUBSPOT_ACCESS_TOKEN}`, "Content-Type": "application/json" };
+  const missing = [];
+  for (const prop of SHOPIFY_ATTRIBUTION_PROPERTIES) {
+    try {
+      await axios.get(`https://api.hubapi.com/crm/v3/properties/contacts/${prop.name}`, { headers: hsHeaders });
+    } catch (err) {
+      if (err.response?.status === 404) missing.push(prop);
+      else console.error(`[Attribution] Could not check property ${prop.name}:`, err.response?.status || err.message);
+    }
+  }
+  if (missing.length === 0) {
+    console.log(`[Attribution] All ${SHOPIFY_ATTRIBUTION_PROPERTIES.length} Shopify attribution properties exist in HubSpot`);
+    return;
+  }
+  for (const prop of missing) {
+    try {
+      await axios.post(
+        "https://api.hubapi.com/crm/v3/properties/contacts",
+        {
+          name: prop.name,
+          label: prop.label,
+          type: prop.type,
+          fieldType: prop.fieldType,
+          groupName: "contactinformation",
+          description: "Set by the Shopify-HubSpot backend from Shopify's order customer journey.",
+        },
+        { headers: hsHeaders }
+      );
+      console.log(`[Attribution] Created HubSpot property: ${prop.name}`);
+    } catch (err) {
+      const status = err.response?.status;
+      if (status === 403) {
+        console.error(`[Attribution] Cannot create HubSpot properties (403) — add the crm.schemas.contacts.write scope to the private app, or create these by hand: ${missing.map(p => p.name).join(", ")}`);
+        return;
+      }
+      console.error(`[Attribution] Failed to create property ${prop.name}:`, err.response?.data?.message || err.message);
+    }
+  }
+}
+
+// Shopify builds the customer journey asynchronously, so it is often not ready
+// the moment orders/create fires. Try now, then after 1 and 5 minutes.
+function scheduleShopifyAttribution(order, contactId) {
+  const delays = [0, 60 * 1000, 5 * 60 * 1000];
+  const attempt = async (i) => {
+    let done = false;
+    try {
+      done = await applyShopifyAttribution(order, contactId);
+    } catch (err) {
+      console.error(`[Attribution] Error for order ${order.id}:`, err.response?.data?.message || err.message);
+      done = true; // don't retry on hard errors
+    }
+    if (done) return;
+    if (i + 1 < delays.length) {
+      setTimeout(() => attempt(i + 1), delays[i + 1]);
+    } else {
+      console.log(`[Attribution] Gave up on order ${order.id} — Shopify journey never became ready`);
+    }
+  };
+  attempt(0);
+}
+
+// Returns true when finished (written or nothing to write), false to retry later.
+async function applyShopifyAttribution(order, contactId) {
+  const shop = process.env.SHOPIFY_SHOP_DOMAIN || "medical-and-lab-supplies.myshopify.com";
+  const orderGid = order.admin_graphql_api_id || `gid://shopify/Order/${order.id}`;
+
+  const gqlRes = await axios.post(
+    `https://${shop}/admin/api/2026-01/graphql.json`,
+    {
+      query: `
+        query OrderAttribution($id: ID!) {
+          order(id: $id) {
+            name
+            customerJourneySummary {
+              ready
+              daysToConversion
+              momentsCount { count }
+              firstVisit {
+                landingPage
+                referrerUrl
+                source
+                utmParameters { source medium campaign }
+              }
+              lastVisit { landingPage }
+            }
+          }
+        }
+      `,
+      variables: { id: orderGid },
+    },
+    { headers: { "X-Shopify-Access-Token": SHOPIFY_ACCESS_TOKEN, "Content-Type": "application/json" } }
+  );
+
+  if (gqlRes.data.errors) {
+    console.error(`[Attribution] Shopify GraphQL error for order ${order.id}:`, JSON.stringify(gqlRes.data.errors));
+    return true;
+  }
+
+  const shopifyOrder = gqlRes.data.data?.order;
+  const journey = shopifyOrder?.customerJourneySummary;
+  if (!journey) {
+    // Draft orders, POS and API-created orders have no online-store journey.
+    console.log(`[Attribution] No customer journey for order ${order.id} (draft/POS/API order) — nothing to write`);
+    return true;
+  }
+  if (!journey.ready) {
+    console.log(`[Attribution] Journey not ready yet for order ${order.id} — will retry`);
+    return false;
+  }
+
+  const first = journey.firstVisit || {};
+  const utm   = first.utmParameters || {};
+  const raw = {
+    shopify_source:                first.source,
+    shopify_utm_source:            utm.source,
+    shopify_utm_medium:            utm.medium,
+    shopify_utm_campaign:          utm.campaign,
+    shopify_referrer_url:          first.referrerUrl,
+    shopify_first_landing_page:    first.landingPage,
+    shopify_last_landing_page:     journey.lastVisit?.landingPage,
+    shopify_sessions_before_order: journey.momentsCount?.count,
+    shopify_days_to_conversion:    journey.daysToConversion,
+    shopify_attribution_order:     shopifyOrder.name,
+  };
+  // Drop empty values so a sparse journey never blanks out earlier data
+  const properties = {};
+  for (const [key, value] of Object.entries(raw)) {
+    if (value !== null && value !== undefined && value !== "") properties[key] = String(value);
+  }
+
+  const hsHeaders = { Authorization: `Bearer ${HUBSPOT_ACCESS_TOKEN}`, "Content-Type": "application/json" };
+  try {
+    await patchHubSpotContact(contactId, properties, hsHeaders);
+    console.log(`[Attribution] Contact ${contactId} ← order ${shopifyOrder.name} | source: ${properties.shopify_source || "-"} | campaign: ${properties.shopify_utm_campaign || "-"}`);
+  } catch (err) {
+    const message = err.response?.data?.message || err.message;
+    if (/does not exist/i.test(message)) {
+      console.error(`[Attribution] HubSpot properties missing — create them (see ensureAttributionProperties): ${message}`);
+    } else {
+      console.error(`[Attribution] Failed to write attribution to contact ${contactId}:`, message);
+    }
+  }
+  return true;
+}
+
+ensureAttributionProperties().catch(err =>
+  console.error("[Attribution] Property check failed:", err.message)
+);
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
