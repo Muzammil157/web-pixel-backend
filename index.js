@@ -28,6 +28,26 @@ db.exec(`
     created_at INTEGER NOT NULL,
     attempts   INTEGER NOT NULL DEFAULT 0
   );
+  -- Shopify recovery link per checkout token (was in-memory only, lost on restart)
+  CREATE TABLE IF NOT EXISTS abandoned_url_map (
+    token      TEXT PRIMARY KEY,
+    url        TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+  );
+  -- First time each checkout token was seen with an email. Gives every
+  -- abandoned checkout a stable shopify_abandoned_date, so repeated
+  -- checkouts/update webhooks for the same checkout don't keep changing it.
+  CREATE TABLE IF NOT EXISTS abandoned_checkouts (
+    token         TEXT PRIMARY KEY,
+    email         TEXT NOT NULL,
+    first_seen_at INTEGER NOT NULL
+  );
+  -- Checkout tokens that turned into an order. checkouts/update webhooks for
+  -- these are ignored so a late webhook can never re-flag a buyer.
+  CREATE TABLE IF NOT EXISTS completed_checkouts (
+    token        TEXT PRIMARY KEY,
+    completed_at INTEGER NOT NULL
+  );
 `);
 const _dbSetHutk          = db.prepare("INSERT OR REPLACE INTO hutk_store (token, hutk, created_at) VALUES (?, ?, ?)");
 const _dbGetHutk          = db.prepare("SELECT hutk FROM hutk_store WHERE token = ?");
@@ -39,6 +59,11 @@ const _dbQueueAttribution  = db.prepare("INSERT OR IGNORE INTO attribution_queue
 const _dbPendingAttribution = db.prepare("SELECT order_id, order_gid, contact_id, created_at, attempts FROM attribution_queue ORDER BY created_at");
 const _dbBumpAttribution   = db.prepare("UPDATE attribution_queue SET attempts = attempts + 1 WHERE order_id = ?");
 const _dbDoneAttribution   = db.prepare("DELETE FROM attribution_queue WHERE order_id = ?");
+const _dbSetAbandonedUrl   = db.prepare("INSERT OR REPLACE INTO abandoned_url_map (token, url, created_at) VALUES (?, ?, ?)");
+const _dbInsertAbandoned   = db.prepare("INSERT OR IGNORE INTO abandoned_checkouts (token, email, first_seen_at) VALUES (?, ?, ?)");
+const _dbGetAbandoned      = db.prepare("SELECT email, first_seen_at FROM abandoned_checkouts WHERE token = ?");
+const _dbSetCompleted      = db.prepare("INSERT OR IGNORE INTO completed_checkouts (token, completed_at) VALUES (?, ?)");
+const _dbIsCompleted       = db.prepare("SELECT 1 FROM completed_checkouts WHERE token = ?");
 
 const app = express();
 app.use(cors({
@@ -64,9 +89,16 @@ const reconciliationMap = new Map();
 const checkoutTokenMap = new Map();
 
 // Abandoned checkout URL index: checkout_token → abandoned_checkout_url
-// Populated by /webhook/checkout-create (Shopify webhook — has the real recovery URL).
-// Consumed by /checkout-completed to set shopify_checkout_url on the HubSpot contact.
+// Populated by /webhook/checkout-create and /webhook/checkout-update (Shopify
+// webhooks — they carry the real recovery URL). Consumed by /checkout-completed
+// to set shopify_checkout_url on the HubSpot contact. Persisted to SQLite.
 const abandonedUrlMap = new Map();
+
+function storeAbandonedUrl(token, url) {
+  if (!token || !url) return;
+  abandonedUrlMap.set(token, url);
+  _dbSetAbandonedUrl.run(token, url, Date.now());
+}
 
 // HubSpot visitor cookie index: checkout_token → hutk
 // checkout/create fires before the customer enters their email, so we can't submit
@@ -82,7 +114,10 @@ for (const row of db.prepare("SELECT token, hutk FROM hutk_store").all()) {
 for (const row of db.prepare("SELECT token, email FROM checkout_token_map").all()) {
   checkoutTokenMap.set(row.token, row.email);
 }
-console.log(`[DB] Seeded ${hutkMap.size} hutk + ${checkoutTokenMap.size} checkout token entries from SQLite`);
+for (const row of db.prepare("SELECT token, url FROM abandoned_url_map").all()) {
+  abandonedUrlMap.set(row.token, row.url);
+}
+console.log(`[DB] Seeded ${hutkMap.size} hutk + ${checkoutTokenMap.size} checkout token + ${abandonedUrlMap.size} recovery URL entries from SQLite`);
 
 
 // Root route (optional)
@@ -125,7 +160,8 @@ app.get('/oauth/callback', async (req, res) => {
 
     const accessToken = response.data.access_token;
 
-    console.log('✅ ACCESS TOKEN:', accessToken);
+    // Never write the full token to the server logs (Render keeps them).
+    console.log(`✅ ACCESS TOKEN issued for ${shop}: ${String(accessToken).slice(0, 6)}…(masked)`);
 
     // 👉 Save this somewhere (DB ideally)
     res.send(`
@@ -262,7 +298,7 @@ app.post('/webhook/checkout-create', (req, res) => {
   // When the pixel fires (checkout_contact_info_submitted), it looks up this URL
   // by token so the real Shopify recovery link ends up on the HubSpot contact.
   if (token && abandonedCheckoutUrl) {
-    abandonedUrlMap.set(token, abandonedCheckoutUrl);
+    storeAbandonedUrl(token, abandonedCheckoutUrl);
     console.log(`[Shopify] Stored abandoned_checkout_url for token: ${token}`);
   } else {
     console.log(`[Shopify] No abandoned_checkout_url to store | token: ${token || "MISSING"}`);
@@ -289,6 +325,170 @@ app.post('/webhook/checkout-create', (req, res) => {
   }
   console.log(`──────────── checkout/create END | token: ${token} ────────────\n`);
 });
+
+// ── Shopify webhook: checkouts/update ──────────────────────────────────────
+// Fires every time a checkout changes (email entered, shipping chosen, items
+// changed, completed). Keeps the abandoned-cart data on the contact current —
+// including shipping and tax, which the pixel doesn't know yet — and clears
+// the flag when the checkout completes.
+//
+// By default it only updates contacts that already exist. Set
+// CHECKOUT_UPDATE_CREATES_CONTACTS=true to also create LEAD contacts for
+// checkouts the pixel never saw (express checkouts, blocked pixels).
+//
+// Shopify fires this webhook many times per checkout, so a fingerprint of the
+// cart is kept per token and HubSpot is only written when something changed.
+const CHECKOUT_UPDATE_CREATES_CONTACTS = process.env.CHECKOUT_UPDATE_CREATES_CONTACTS === "true";
+const checkoutFingerprints = new Map(); // token → last written fingerprint (in-memory is enough)
+
+app.post('/webhook/checkout-update', (req, res) => {
+  res.sendStatus(200); // respond immediately — Shopify requires fast acknowledgement
+  handleCheckoutUpdate(req.body).catch(err =>
+    console.error("[checkout/update] Error:", err.response?.data?.message || err.message)
+  );
+});
+
+async function handleCheckoutUpdate(checkout) {
+  const token = checkout.token || "";
+  const email = (checkout.email || checkout.customer?.email || "").trim().toLowerCase();
+
+  // Keep the recovery link and hutk current, same as checkout/create
+  storeAbandonedUrl(token, checkout.abandoned_checkout_url || "");
+  const noteAttributes = Array.isArray(checkout.note_attributes) ? checkout.note_attributes : [];
+  const hutk = noteAttributes.find(attr => attr.name === "hubspotutk")?.value || null;
+  if (hutk && token && !hutkMap.has(token)) {
+    hutkMap.set(token, hutk);
+    _dbSetHutk.run(token, hutk, Date.now());
+  }
+
+  if (!HUBSPOT_ACCESS_TOKEN || !email) return; // nothing to attach the cart to yet
+
+  const hsHeaders = {
+    Authorization: `Bearer ${HUBSPOT_ACCESS_TOKEN}`,
+    "Content-Type": "application/json",
+  };
+
+  // ── Completed checkout: clear the flag on the checkout's email ────────────
+  // orders/create clears it too, but only on the contact the order matched.
+  // This also covers a checkout email that differs from the order email.
+  if (checkout.completed_at) {
+    markCheckoutCompleted(token);
+    checkoutFingerprints.delete(token);
+    const contact = await findHubSpotContactByEmail(email, hsHeaders);
+    if (contact && contact.properties?.shopify_is_abandoned === "true") {
+      await patchHubSpotContact(contact.id, { shopify_is_abandoned: "false", shopify_has_order: "true" }, hsHeaders);
+      console.log(`[checkout/update] Checkout ${token} completed — cleared abandoned flag on contact ${contact.id}`);
+    }
+    return;
+  }
+
+  // An order already exists for this checkout — never re-flag the buyer
+  if (isCheckoutCompleted(token)) {
+    console.log(`[checkout/update] Token ${token} already ordered — ignoring late update`);
+    return;
+  }
+
+  const lineItems = Array.isArray(checkout.line_items) ? checkout.line_items : [];
+  const shipping  = Array.isArray(checkout.shipping_lines) && checkout.shipping_lines.length
+    ? checkout.shipping_lines.reduce((sum, line) => sum + (toNumber(line.price) || 0), 0)
+    : null;
+  const amounts = {
+    subtotal:  checkout.subtotal_price,
+    total:     checkout.total_price,
+    shipping,
+    tax:       checkout.total_tax,
+    itemCount: countItems(lineItems),
+  };
+  const checkoutUrl = checkout.abandoned_checkout_url || abandonedUrlMap.get(token) || "";
+
+  // Skip if nothing changed since the last write for this checkout
+  const fingerprint = JSON.stringify({
+    email, checkoutUrl, amounts,
+    items: lineItems.map(i => [i.variant_id, i.quantity, i.price]),
+  });
+  if (checkoutFingerprints.get(token) === fingerprint) return;
+
+  // Images and product links aren't in the webhook — look them up. If that
+  // fails, cartHTML stays null and the existing cart HTML is kept as-is.
+  let cartHTML = null;
+  if (lineItems.length) {
+    const details = await fetchVariantDetails(lineItems.map(i => i.variant_id));
+    if (details) {
+      cartHTML = generateCartHTML(normalizeWebhookLineItems(lineItems, details), checkout.currency || DEFAULT_CURRENCY);
+    }
+  }
+
+  const result = await flagAbandonedCheckout({
+    email,
+    firstName: checkout.billing_address?.first_name || checkout.customer?.first_name || "",
+    lastName:  checkout.billing_address?.last_name  || checkout.customer?.last_name  || "",
+    token,
+    cartHTML,
+    amounts,
+    checkoutUrl,
+    createIfMissing: CHECKOUT_UPDATE_CREATES_CONTACTS,
+  });
+  if (checkoutFingerprints.size > 5000) checkoutFingerprints.clear(); // bound memory
+  checkoutFingerprints.set(token, fingerprint);
+  console.log(`[checkout/update] token: ${token} | email: ${email} | ${result.action}${result.contactId ? ` | contact ${result.contactId}` : ""}`);
+
+  // A contact created here never went through the pixel, so stitch its
+  // browsing history with the hutk if we have one.
+  if (result.action === "created" && !checkoutTokenMap.has(token)) {
+    const knownHutk = hutkMap.get(token) || null;
+    if (knownHutk) {
+      submitHubSpotForm(email, knownHutk).catch(err =>
+        console.error("[HubSpot Form] checkout/update error:", err.message)
+      );
+    }
+  }
+}
+
+// Looks up image + product link for each variant ID via Shopify GraphQL.
+// Returns { [variantId]: { imageUrl, productUrl } }, or null if the lookup
+// failed (e.g. missing read_products scope) so callers can keep old data.
+async function fetchVariantDetails(variantIds) {
+  const ids = [...new Set(variantIds.filter(Boolean).map(id => `gid://shopify/ProductVariant/${id}`))];
+  if (!ids.length) return {};
+  const shop = process.env.SHOPIFY_SHOP_DOMAIN || "medical-and-lab-supplies.myshopify.com";
+  try {
+    const res = await axios.post(
+      `https://${shop}/admin/api/2026-01/graphql.json`,
+      {
+        query: `
+          query VariantDetails($ids: [ID!]!) {
+            nodes(ids: $ids) {
+              ... on ProductVariant {
+                id
+                image { url }
+                product { handle onlineStoreUrl featuredImage { url } }
+              }
+            }
+          }
+        `,
+        variables: { ids },
+      },
+      { headers: { "X-Shopify-Access-Token": SHOPIFY_ACCESS_TOKEN, "Content-Type": "application/json" } }
+    );
+    if (res.data.errors) {
+      console.error("[checkout/update] Variant lookup error:", JSON.stringify(res.data.errors));
+      return null;
+    }
+    const details = {};
+    for (const node of res.data.data?.nodes || []) {
+      if (!node?.id) continue;
+      const variantId = node.id.split("/").pop();
+      details[variantId] = {
+        imageUrl:   node.image?.url || node.product?.featuredImage?.url || "",
+        productUrl: node.product?.onlineStoreUrl || (node.product?.handle ? `/products/${node.product.handle}` : ""),
+      };
+    }
+    return details;
+  } catch (err) {
+    console.error("[checkout/update] Variant lookup failed:", err.response?.status || err.message);
+    return null;
+  }
+}
 
 // ── Pixel: checkout_started ────────────────────────────────────────────────
 // Fired by the web pixel for ALL checkout paths including accelerated checkout
@@ -317,6 +517,9 @@ app.post('/webhook/orders-create', async (req, res) => {
   res.sendStatus(200);
 
   console.log(`\n▓▓▓▓▓▓▓▓▓▓▓▓ ORDER: orders/create | order: ${order.id} | email: ${order.email || "MISSING"} ▓▓▓▓▓▓▓▓▓▓▓▓`);
+
+  // This checkout is now an order — late checkouts/update webhooks for it are ignored
+  markCheckoutCompleted(order.checkout_token);
 
   // customerEmail: fallback when order.email is missing (common for accelerated checkout).
   // The Shopify customer record almost always has an email even when the order payload doesn't.
@@ -533,19 +736,98 @@ async function submitHubSpotForm(email, hutk) {
   }
 }
 
-// ── Abandoned Cart HTML Helper ─────────────────────────────────────────────
-// Generates an email-safe, table-based HTML string from Shopify line items.
-// Used to populate shopify_abandoned_cart_html on the HubSpot contact.
-function generateCartHTML(lineItems) {
-  if (!Array.isArray(lineItems) || lineItems.length === 0) return "";
+// ── Abandoned Cart Helpers ─────────────────────────────────────────────────
+// Storefront domain used to turn relative product links ("/products/…") into
+// absolute ones — relative links don't work inside an email.
+const STOREFRONT_URL = (process.env.STOREFRONT_URL || "https://www.medical-and-lab-supplies.com").replace(/\/+$/, "");
+const DEFAULT_CURRENCY = "USD";
 
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function toNumber(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const n = parseFloat(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function formatMoney(amount, currency) {
+  try {
+    return new Intl.NumberFormat("en-US", { style: "currency", currency: currency || DEFAULT_CURRENCY }).format(amount);
+  } catch {
+    return `$${Number(amount).toFixed(2)}`;
+  }
+}
+
+function absoluteStoreUrl(url) {
+  if (!url || url === "#") return "";
+  if (/^https?:\/\//i.test(url)) return url;
+  if (url.startsWith("//")) return `https:${url}`;
+  return `${STOREFRONT_URL}${url.startsWith("/") ? "" : "/"}${url}`;
+}
+
+// Pixel line items → common shape. The pixel's `price` is the LINE TOTAL
+// (finalLinePrice: unit price × quantity, after discounts), not a unit price.
+function normalizePixelLineItems(lineItems) {
+  if (!Array.isArray(lineItems)) return [];
   return lineItems.map(item => {
-    const title      = item.title        || "Product";
-    const price      = item.variant?.price?.amount || item.price || "0.00";
-    const quantity   = item.quantity     || 1;
-    const imageUrl   = item.variant?.image?.src    || item.image || item.image_url || "";
-    const productUrl = item.variant?.product?.url  || item.url   || item.product_url
-                    || item.variant_url  || "#";
+    const quantity  = Number(item.quantity) || 1;
+    const lineTotal = toNumber(item.line_total ?? item.price);
+    return {
+      title:      item.title || "Product",
+      quantity,
+      lineTotal,
+      imageUrl:   item.image_url || "",
+      productUrl: item.url || "",
+    };
+  });
+}
+
+// Shopify checkout webhook line items → common shape. Here `price` is the
+// UNIT price and `line_price` the line total. Images and links come from
+// `details` (looked up by variant ID), because the webhook doesn't include them.
+function normalizeWebhookLineItems(lineItems, details = {}) {
+  if (!Array.isArray(lineItems)) return [];
+  return lineItems.map(item => {
+    const quantity  = Number(item.quantity) || 1;
+    const unitPrice = toNumber(item.price);
+    const lineTotal = toNumber(item.line_price) ?? (unitPrice !== null ? unitPrice * quantity : null);
+    const d = details[String(item.variant_id)] || {};
+    return {
+      title:      item.title || "Product",
+      quantity,
+      lineTotal,
+      imageUrl:   d.imageUrl || "",
+      productUrl: d.productUrl || "",
+    };
+  });
+}
+
+// Generates an email-safe, table-based HTML string from normalized line items.
+// Used to populate shopify_abandoned_cart_html on the HubSpot contact.
+// Price line: "Qty: 2 · $5.99 each · $11.98" (or "Qty: 1 · $5.99").
+function generateCartHTML(items, currency = DEFAULT_CURRENCY) {
+  if (!Array.isArray(items) || items.length === 0) return "";
+
+  return items.map(item => {
+    const title      = escapeHtml(item.title || "Product");
+    const quantity   = Number(item.quantity) || 1;
+    const lineTotal  = toNumber(item.lineTotal);
+    const imageUrl   = item.imageUrl ? escapeHtml(absoluteStoreUrl(item.imageUrl)) : "";
+    const productUrl = escapeHtml(absoluteStoreUrl(item.productUrl) || STOREFRONT_URL);
+
+    let priceLine = `Qty: ${quantity}`;
+    if (lineTotal !== null) {
+      priceLine += quantity > 1
+        ? ` &middot; ${formatMoney(lineTotal / quantity, currency)} each &middot; ${formatMoney(lineTotal, currency)}`
+        : ` &middot; ${formatMoney(lineTotal, currency)}`;
+    }
 
     const imgTag = imageUrl
       ? `<img src="${imageUrl}" width="100" style="border-radius:8px;display:block;" alt="${title}" />`
@@ -557,13 +839,161 @@ function generateCartHTML(lineItems) {
           `<td width="100" style="padding-right:10px;vertical-align:top;">${imgTag}</td>` +
           `<td style="vertical-align:top;">` +
             `<p style="margin:0;font-size:16px;font-weight:bold;color:#111;">${title}</p>` +
-            `<p style="margin:5px 0;color:#555;font-size:14px;">Rs. ${price} (Qty: ${quantity})</p>` +
+            `<p style="margin:5px 0;color:#555;font-size:14px;">${priceLine}</p>` +
             `<a href="${productUrl}" style="color:#007bff;text-decoration:none;font-size:14px;">View Product</a>` +
           `</td>` +
         `</tr>` +
       `</table>`
     );
   }).join("");
+}
+
+// Cart amounts → HubSpot properties. Only values we actually have are written,
+// so a partial payload never blanks out earlier data.
+function abandonedAmountProps({ subtotal, total, shipping, tax, itemCount }) {
+  const props = {};
+  const put = (name, value) => {
+    const n = toNumber(value);
+    if (n !== null) props[name] = String(Math.round(n * 100) / 100);
+  };
+  put("shopify_abandoned_value",    subtotal);
+  put("shopify_abandoned_total",    total);
+  put("shopify_abandoned_shipping", shipping);
+  put("shopify_abandoned_tax",      tax);
+  if (Number.isFinite(itemCount) && itemCount > 0) props.shopify_abandoned_item_count = String(itemCount);
+  return props;
+}
+
+function sumLineTotals(items) {
+  let sum = 0, any = false;
+  for (const item of items) {
+    const n = toNumber(item.lineTotal);
+    if (n !== null) { sum += n; any = true; }
+  }
+  return any ? sum : null;
+}
+
+function countItems(items) {
+  return items.reduce((n, item) => n + (Number(item.quantity) || 0), 0);
+}
+
+// Records the first time a checkout token was seen with an email and returns
+// that timestamp. It is the checkout's shopify_abandoned_date: stable for the
+// same checkout, new for each new checkout (which lets workflows re-enroll).
+function abandonedFirstSeen(token, email) {
+  if (!token) return Date.now();
+  _dbInsertAbandoned.run(token, email, Date.now());
+  return _dbGetAbandoned.get(token)?.first_seen_at || Date.now();
+}
+
+function markCheckoutCompleted(token) {
+  if (token) _dbSetCompleted.run(token, Date.now());
+}
+
+function isCheckoutCompleted(token) {
+  return Boolean(token && _dbIsCompleted.get(token));
+}
+
+// ── Flag a contact as an abandoned checkout ───────────────────────────────
+// Shared by the pixel (/checkout-completed) and the checkouts/update webhook.
+// Rules (unchanged from the original pixel route):
+//   • lifecyclestage "customer" → left alone entirely
+//   • shopify_has_order "true"  → cart data refreshed, but never re-flagged
+//     (repeat-customer flagging is pending a decision)
+//   • otherwise → lead + shopify_is_abandoned=true + cart data
+// shopify_abandoned_date is written only when the contact is flagged, and it
+// is the first time THIS checkout was seen — so it changes once per new
+// abandoned checkout, which is what the workflow re-enrolls on.
+// cartHTML === null means "no cart HTML available, keep what's there".
+// Returns { contactId, action } where action is created | flagged |
+// refreshed | skipped-customer | not-found.
+async function flagAbandonedCheckout({ email, firstName = "", lastName = "", token = "",
+                                       cartHTML = null, amounts = {}, checkoutUrl = "",
+                                       createIfMissing = true }) {
+  const hsHeaders = {
+    Authorization: `Bearer ${HUBSPOT_ACCESS_TOKEN}`,
+    "Content-Type": "application/json",
+  };
+
+  const firstSeen  = abandonedFirstSeen(token, email);
+  const cartProps  = { ...abandonedAmountProps(amounts) };
+  if (cartHTML !== null) cartProps.shopify_abandoned_cart_html = cartHTML;
+  if (checkoutUrl)       cartProps.shopify_checkout_url        = checkoutUrl;
+  const dateProp   = { shopify_abandoned_date: new Date(firstSeen).toISOString() };
+
+  const updateExisting = async (existing) => {
+    const currentStage = existing.properties?.lifecyclestage;
+    if (currentStage === "customer") {
+      console.log(`[HubSpot] Contact ${existing.id} is already CUSTOMER — skipping lifecycle downgrade`);
+      return { contactId: existing.id, action: "skipped-customer" };
+    }
+
+    const updateProps = { lifecyclestage: "lead", ...cartProps };
+
+    // Fix placeholder names set by previous "Guest"/"Shopify" fallback
+    if (firstName && (!existing.properties?.firstname || existing.properties.firstname === "Guest")) {
+      updateProps.firstname = firstName;
+    }
+    if (lastName && (!existing.properties?.lastname || existing.properties.lastname === "Shopify")) {
+      updateProps.lastname = lastName;
+    }
+
+    // Segmentation flags — only if this contact does NOT already have a
+    // confirmed order (shopify_has_order=true). Never overwrite purchase truth.
+    let action = "refreshed";
+    if (existing.properties?.shopify_has_order !== "true") {
+      updateProps.shopify_has_order    = "false";
+      updateProps.shopify_is_abandoned = "true";
+      Object.assign(updateProps, dateProp);
+      // Preserve contact_attempted if marketing already set it to true
+      if (existing.properties?.contact_attempted !== "true") {
+        updateProps.contact_attempted = "false";
+      }
+      action = "flagged";
+    }
+
+    await patchHubSpotContact(existing.id, updateProps, hsHeaders);
+    console.log(`[HubSpot] Existing contact ${existing.id} updated to LEAD (${action})`);
+    return { contactId: existing.id, action };
+  };
+
+  const existing = await findHubSpotContactByEmail(email, hsHeaders);
+  if (existing) return updateExisting(existing);
+  if (!createIfMissing) return { contactId: null, action: "not-found" };
+
+  // No contact yet — create as LEAD only (checkout = intent, not purchase)
+  try {
+    const res = await axios.post(
+      "https://api.hubapi.com/crm/v3/objects/contacts",
+      {
+        properties: {
+          email,
+          firstname: firstName,
+          lastname:  lastName,
+          lifecyclestage:       "lead",
+          shopify_has_order:    "false",
+          shopify_is_abandoned: "true",
+          contact_attempted:    "false",
+          ...cartProps,
+          ...dateProp,
+        },
+      },
+      { headers: hsHeaders }
+    );
+    console.log("[HubSpot] LEAD contact created:", res.data.id);
+    return { contactId: res.data.id, action: "created" };
+  } catch (err) {
+    // 409: created in the meantime (native app, or a parallel webhook).
+    // Re-read it and apply the same rules as for an existing contact, so a
+    // customer is never pushed back to lead.
+    if (err.response?.status === 409) {
+      console.log(`[HubSpot] Contact for ${email} appeared meanwhile (409) — applying update rules instead`);
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      const raced = await findHubSpotContactByEmail(email, hsHeaders);
+      if (raced) return updateExisting(raced);
+    }
+    throw err;
+  }
 }
 
 // Shopify webhook endpoint for contact creation
@@ -590,110 +1020,38 @@ app.post("/checkout-completed", async (req, res) => {
       return res.status(200).json({ success: true });
     }
 
-    // 1️⃣ Check if contact already exists
-    const searchResponse = await axios.post(
-      "https://api.hubapi.com/crm/v3/objects/contacts/search",
-      {
-        filterGroups: [
-          {
-            filters: [
-              {
-                propertyName: "email",
-                operator: "EQ",
-                value: email,
-              },
-            ],
-          },
-        ],
-        properties: ["email", "firstname", "lastname", "lifecyclestage",
-                     "shopify_has_order", "shopify_is_abandoned", "contact_attempted"],
-        limit: 1,
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${HUBSPOT_ACCESS_TOKEN}`,
-          "Content-Type": "application/json",
-        },
-      }
-    );
-
-    const hsHeaders = {
-      Authorization: `Bearer ${HUBSPOT_ACCESS_TOKEN}`,
-      "Content-Type": "application/json",
-    };
-
-    // ── Abandoned cart data — computed once, injected into both create + update ──
-    // checkoutUrl: use the real Shopify recovery URL stored by /webhook/checkout-create,
-    // fall back to constructing from token if the checkout/create webhook hasn't fired yet.
+    // ── Abandoned cart data ──────────────────────────────────────────────────
+    // checkoutUrl: use the real Shopify recovery URL stored by the checkout
+    // webhooks, fall back to constructing from token if they haven't fired yet.
     const shop = process.env.SHOPIFY_SHOP_DOMAIN || "medical-and-lab-supplies.myshopify.com";
-    const abandonedCartHTML = generateCartHTML(webhookCheckout.line_items);
+    const currency  = webhookCheckout.currency || DEFAULT_CURRENCY;
+    const cartItems = normalizePixelLineItems(webhookCheckout.line_items);
+    const abandonedCartHTML = generateCartHTML(cartItems, currency);
     const checkoutUrl = (webhookToken && abandonedUrlMap.get(webhookToken))
                      || (webhookToken ? `https://${shop}/checkouts/${webhookToken}` : "");
 
-    if (searchResponse.data.results.length === 0) {
-      // 2️⃣ No contact yet — create as LEAD only (pixel = intent, not purchase)
-      const contactResponse = await axios.post(
-        "https://api.hubapi.com/crm/v3/objects/contacts",
-        {
-          properties: {
-            email: email,
-            firstname: firstName,
-            lastname: lastName,
-            lifecyclestage: "lead",
-            // Segmentation flags — pixel/checkout = abandoned intent, never a purchase
-            shopify_has_order:   "false",
-            shopify_is_abandoned: "true",
-            contact_attempted:   "false",
-            // Abandoned cart data
-            shopify_abandoned_cart_html: abandonedCartHTML,
-            shopify_checkout_url:        checkoutUrl,
-          },
-        },
-        { headers: hsHeaders }
-      );
-      console.log("[HubSpot] LEAD contact created:", contactResponse.data.id);
-    } else {
-      // 3️⃣ Contact exists — only update to lead if not already a customer
-      // HubSpot lifecycle can only move forward, never backward
-      const existing = searchResponse.data.results[0];
-      const currentStage = existing.properties?.lifecyclestage;
+    // Amounts: subtotal/tax/shipping come from the updated pixel; older pixel
+    // payloads only have `total`, so the subtotal falls back to the line totals.
+    // Shipping and tax are usually unknown at this step — checkouts/update fills them in.
+    const amounts = {
+      subtotal:  toNumber(webhookCheckout.subtotal) ?? sumLineTotals(cartItems),
+      total:     webhookCheckout.total,
+      shipping:  webhookCheckout.shipping,
+      tax:       webhookCheckout.tax,
+      itemCount: countItems(cartItems),
+    };
 
-      if (currentStage !== "customer") {
-        const updateProps = { lifecyclestage: "lead" };
-
-        // Fix placeholder names set by previous "Guest"/"Shopify" fallback
-        if (!existing.properties?.firstname || existing.properties.firstname === "Guest") {
-          updateProps.firstname = firstName;
-        }
-        if (!existing.properties?.lastname || existing.properties.lastname === "Shopify") {
-          updateProps.lastname = lastName;
-        }
-
-        // Segmentation flags — only apply if this contact does NOT already have
-        // a confirmed order (shopify_has_order=true). Never overwrite purchase truth.
-        if (existing.properties?.shopify_has_order !== "true") {
-          updateProps.shopify_has_order    = "false";
-          updateProps.shopify_is_abandoned = "true";
-          // Preserve contact_attempted if marketing already set it to true
-          if (existing.properties?.contact_attempted !== "true") {
-            updateProps.contact_attempted = "false";
-          }
-        }
-
-        // Always update abandoned cart data — reflects the latest checkout session
-        updateProps.shopify_abandoned_cart_html = abandonedCartHTML;
-        updateProps.shopify_checkout_url        = checkoutUrl;
-
-        await axios.patch(
-          `https://api.hubapi.com/crm/v3/objects/contacts/${existing.id}`,
-          { properties: updateProps },
-          { headers: hsHeaders }
-        );
-        console.log(`[HubSpot] Existing contact ${existing.id} updated to LEAD`);
-      } else {
-        console.log(`[HubSpot] Contact ${existing.id} is already CUSTOMER — skipping lifecycle downgrade`);
-      }
-    }
+    // Create the contact as LEAD, or update the existing one (see flagAbandonedCheckout)
+    await flagAbandonedCheckout({
+      email: email.toLowerCase(),
+      firstName,
+      lastName,
+      token: webhookToken,
+      cartHTML: abandonedCartHTML,
+      amounts,
+      checkoutUrl,
+      createIfMissing: true,
+    });
 
     // Track in reconciliation map — include token for order-side bridging
     const checkoutToken = webhookToken;
@@ -954,6 +1312,30 @@ async function reconcileOrderContact(order, customerEmailFallback = "", customer
     }
   }
 
+  // ── Clear the abandoned flag on every contact tied to this checkout ────────
+  // The order above only updates the contact it matched. If the shopper typed
+  // a different email at checkout (pixel / checkouts/update), that contact
+  // would otherwise stay flagged forever. Same buyer, so clear it too.
+  if (order.checkout_token) {
+    const tokenEmails = new Set(
+      [checkoutTokenMap.get(order.checkout_token), _dbGetAbandoned.get(order.checkout_token)?.email]
+        .filter(Boolean)
+        .map(e => e.trim().toLowerCase())
+    );
+    tokenEmails.delete((resolvedEmail || "").toLowerCase());
+    for (const otherEmail of tokenEmails) {
+      try {
+        const other = await findHubSpotContactByEmail(otherEmail, hsHeaders);
+        if (other && other.id !== contactId && other.properties?.shopify_is_abandoned === "true") {
+          await patchHubSpotContact(other.id, { shopify_is_abandoned: "false" }, hsHeaders);
+          console.log(`[HubSpot] Order ${order.id} — also cleared abandoned flag on contact ${other.id} (${otherEmail}, same checkout)`);
+        }
+      } catch (err) {
+        console.error(`[HubSpot] Could not clear abandoned flag for ${otherEmail}:`, err.response?.data?.message || err.message);
+      }
+    }
+  }
+
   // Update reconciliation map — order is always the final truth
   if (resolvedEmail) {
     reconciliationMap.set(resolvedEmail, {
@@ -1022,6 +1404,20 @@ const SHOPIFY_ATTRIBUTION_PROPERTIES = [
   { name: "shopify_attribution_order",   label: "Shopify Attribution Order",                  type: "string", fieldType: "text"   },
 ];
 
+// Abandoned-checkout properties (2026-10-26). Written by the pixel route and
+// the checkouts/update webhook; created at startup like the ones above.
+const ABANDONED_DESCRIPTION = "Set by the Shopify-HubSpot backend from the shopper's latest abandoned checkout.";
+const SHOPIFY_ABANDONED_PROPERTIES = [
+  { name: "shopify_abandoned_date",       label: "Shopify Abandoned Checkout Date",     type: "datetime", fieldType: "date",
+    description: "When the latest abandoned checkout started. Changes once per new abandoned checkout — use it to re-enroll contacts in the recovery workflow." },
+  { name: "shopify_abandoned_value",      label: "Shopify Abandoned Cart Subtotal",     type: "number",   fieldType: "number" },
+  { name: "shopify_abandoned_total",      label: "Shopify Abandoned Checkout Total",    type: "number",   fieldType: "number",
+    description: "Checkout total including shipping and tax, once the shopper has reached that step." },
+  { name: "shopify_abandoned_shipping",   label: "Shopify Abandoned Checkout Shipping", type: "number",   fieldType: "number" },
+  { name: "shopify_abandoned_tax",        label: "Shopify Abandoned Checkout Tax",      type: "number",   fieldType: "number" },
+  { name: "shopify_abandoned_item_count", label: "Shopify Abandoned Cart Item Count",   type: "number",   fieldType: "number" },
+];
+
 // Creates any missing attribution properties at startup.
 // Needs the crm.schemas.contacts.write scope on the HubSpot private app;
 // without it, the properties must be created by hand in HubSpot.
@@ -1029,7 +1425,11 @@ async function ensureAttributionProperties() {
   if (!HUBSPOT_ACCESS_TOKEN) return;
   const hsHeaders = { Authorization: `Bearer ${HUBSPOT_ACCESS_TOKEN}`, "Content-Type": "application/json" };
   const missing = [];
-  for (const prop of SHOPIFY_ATTRIBUTION_PROPERTIES) {
+  const allProps = [
+    ...SHOPIFY_ATTRIBUTION_PROPERTIES,
+    ...SHOPIFY_ABANDONED_PROPERTIES.map(p => ({ ...p, description: p.description || ABANDONED_DESCRIPTION })),
+  ];
+  for (const prop of allProps) {
     try {
       await axios.get(`https://api.hubapi.com/crm/v3/properties/contacts/${prop.name}`, { headers: hsHeaders });
     } catch (err) {
@@ -1038,7 +1438,7 @@ async function ensureAttributionProperties() {
     }
   }
   if (missing.length === 0) {
-    console.log(`[Attribution] All ${SHOPIFY_ATTRIBUTION_PROPERTIES.length} Shopify attribution properties exist in HubSpot`);
+    console.log(`[Attribution] All ${allProps.length} Shopify attribution + abandoned-checkout properties exist in HubSpot`);
     return;
   }
   for (const prop of missing) {
@@ -1051,7 +1451,7 @@ async function ensureAttributionProperties() {
           type: prop.type,
           fieldType: prop.fieldType,
           groupName: "contactinformation",
-          description: "Set by the Shopify-HubSpot backend from Shopify's order customer journey.",
+          description: prop.description || "Set by the Shopify-HubSpot backend from Shopify's order customer journey.",
         },
         { headers: hsHeaders }
       );
@@ -1215,26 +1615,6 @@ async function applyShopifyAttribution(job) {
 ensureAttributionProperties().catch(err =>
   console.error("[Attribution] Property check failed:", err.message)
 );
-
-// ── One-time backfill (2026-10-12) ─────────────────────────────────────────
-// Orders placed after the first attribution release, whose attribution was
-// dropped by the old 5-minute retry. Seeded into the queue on startup until
-// 2026-10-14; re-writing the same values on a restart is harmless.
-// Safe to delete this block after 2026-10-14.
-const ATTRIBUTION_BACKFILL = [
-  // [order id,       HubSpot contact id]   order   / contact
-  ["7378605408574", "254501290096"],    // #398793 / Shane Spurlock (phone-only)
-  ["7378606948670", "53468051"],        // #398794 / sambay818@yahoo.com
-  ["7378664915262", "254504597810"],    // #398795 / kylep@lenz-tx.com
-  ["7378714984766", "122625386408"],    // #398796 / aidanye@gmail.com
-  ["7378719670590", "102211417870"],    // #398797 / k3vinsanch0@gmail.com
-];
-if (Date.now() < Date.parse("2026-10-14T00:00:00Z")) {
-  for (const [orderId, contactId] of ATTRIBUTION_BACKFILL) {
-    _dbQueueAttribution.run(orderId, `gid://shopify/Order/${orderId}`, contactId, Date.now());
-  }
-  console.log(`[Attribution] Backfill: ${ATTRIBUTION_BACKFILL.length} order(s) seeded into the queue`);
-}
 
 // Retry queued attribution every 10 minutes; first sweep 1 minute after start
 // so orders queued before a restart are picked up promptly.

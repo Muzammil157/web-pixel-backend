@@ -59,7 +59,10 @@ Go to **Shopify Admin → Settings → Notifications → Webhooks → Create web
 | Event | URL | Format |
 |---|---|---|
 | Checkout creation | `https://{your-backend}.onrender.com/webhook/checkout-create` | JSON |
+| Checkout update | `https://{your-backend}.onrender.com/webhook/checkout-update` | JSON |
 | Order creation | `https://{your-backend}.onrender.com/webhook/orders-create` | JSON |
+
+The checkout update webhook keeps the abandoned-cart data (value, shipping, tax, items) current and clears the abandoned flag when a checkout completes. Its product images and links are looked up via the Admin API, which needs the `read_products` scope; without it the cart HTML from the pixel is kept as-is.
 
 #### 1.3 Install the Web Pixel Extension
 
