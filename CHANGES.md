@@ -2,6 +2,59 @@
 
 ---
 
+## [2026-10-26] Abandoned-cart fixes from Courtney's review: re-enrollment date, cart value, checkouts/update, cleanup
+
+**Files changed:** `index.js`, `scripts/clear-abandoned-buyers.js` (new), `SETUP_GUIDE.md`, `.gitignore`, and the web pixel (`shopify-pixel/web-pixel/extensions/web-pixel-extension/src/index.js`)
+
+### Problems (Courtney Grogan, 2026-10-23)
+- `shopify_is_abandoned` is written as `true` again on every new abandoned checkout. Because the value doesn't change, HubSpot workflows never re-enroll repeat abandoners.
+- Some buyers stay flagged after ordering (Evie Park: abandoned 2026-09-03, ordered #396142 on 2026-09-12, still `true`) because the order wasn't matched to the flagged contact.
+- No cart value is stored, so totals can't be compared with Shopify (Beckman: native cart $25.75 vs a $5.99 item — shipping isn't stored anywhere on our side).
+- Cart HTML showed "Rs." instead of "$", product links were relative (`/products/…`, broken in email), the price was the line total without saying so, and titles with a `"` broke the image `alt` attribute.
+
+### Fix 1 — `shopify_abandoned_date` for workflow re-enrollment
+New datetime property, written whenever a contact is flagged. It is the first time *this* checkout token was seen (new SQLite table `abandoned_checkouts`), so it stays the same while the shopper keeps editing one checkout and changes once per new abandoned checkout. Workflows can re-enroll on this property changing.
+
+### Fix 2 — Cart value properties
+New number properties: `shopify_abandoned_value` (subtotal), `shopify_abandoned_total`, `shopify_abandoned_shipping`, `shopify_abandoned_tax`, `shopify_abandoned_item_count`. Only values that are known are written, so a partial payload never blanks earlier data. All new properties are created at startup by `ensureAttributionProperties()`.
+
+### Fix 3 — New `checkouts/update` webhook → `/webhook/checkout-update`
+- Updates the cart HTML, value, shipping, tax and recovery URL as the checkout changes. Images/links are looked up per variant via Admin GraphQL (needs `read_products`); if the lookup fails the existing cart HTML is kept.
+- `completed_at` set → clears `shopify_is_abandoned` (and sets `shopify_has_order`) on the checkout's email.
+- Tokens that became orders are recorded (new table `completed_checkouts`, written by `orders/create` too) and later updates for them are ignored, so a late webhook can't re-flag a buyer.
+- Shopify fires this many times per checkout; a per-token fingerprint skips HubSpot writes when nothing changed.
+- By default it only updates existing contacts. `CHECKOUT_UPDATE_CREATES_CONTACTS=true` also creates LEAD contacts for checkouts the pixel never saw (express checkouts) — off until the abandoned-cart workflow decisions are made.
+- **Manual step:** register the `checkouts/update` webhook in Shopify Admin (see `SETUP_GUIDE.md` §1.2).
+
+### Fix 4 — Orders clear every contact tied to the checkout
+`reconcileOrderContact` now also clears `shopify_is_abandoned` on any other contact whose email was used for the same checkout token (pixel email or checkouts/update email), not just the contact the order matched.
+
+### Fix 5 — Cart HTML
+`generateCartHTML` now takes normalized items (`normalizePixelLineItems` / `normalizeWebhookLineItems`) and the currency: prices in `$` (`Intl.NumberFormat`), "Qty: 2 · $5.79 each · $11.58", absolute product links (`STOREFRONT_URL`, default `https://www.medical-and-lab-supplies.com`), and HTML-escaped titles.
+
+### Fix 6 — Shared flagging logic
+The pixel route and the new webhook both use `flagAbandonedCheckout()`. Rules are unchanged: customers are left alone; contacts with `shopify_has_order=true` get their cart data refreshed but are never re-flagged (repeat-customer flagging is pending a decision). A 409 on create now re-reads the contact and applies the same rules instead of failing.
+
+### Fix 7 — Recovery URL survives restarts
+`abandonedUrlMap` is now persisted to SQLite (`abandoned_url_map`) and seeded on startup, like `hutkMap`.
+
+### Housekeeping
+- Removed the expired `ATTRIBUTION_BACKFILL` block (all 5 orders were written 2026-10-13).
+- `/oauth/callback` no longer writes the full Shopify access token to the server logs.
+
+### Web pixel
+`checkout_contact_info_submitted` now also sends `subtotal`, `tax`, `shipping` and `currency`. The backend accepts older payloads without them (subtotal falls back to the sum of line totals). Deploy with `shopify app deploy` from `shopify-pixel/web-pixel`.
+
+### One-time cleanup — `scripts/clear-abandoned-buyers.js`
+Finds contacts with `shopify_is_abandoned=true` who have a Shopify order placed on/after their abandon date (`shopify_abandoned_date`, else `recent_conversion_date`, 10-minute tolerance) and clears them (`shopify_is_abandoned=false`, `shopify_has_order=true`). Dry run by default (`node scripts/clear-abandoned-buyers.js`) writes a CSV report; `--apply` updates HubSpot. Reports are git-ignored (they contain emails).
+
+### Not changed — waiting on Bill / Courtney
+- Expiry window for old abandoned checkouts (14 / 30 days) and the stale-flag cleanup that goes with it.
+- Whether recovery runs off this flag or HubSpot's native Cart objects.
+- Whether repeat customers who abandon should be flagged.
+
+---
+
 ## [2026-10-12, later] Attribution retries moved to a persistent 24-hour queue
 
 **File changed:** `index.js`
