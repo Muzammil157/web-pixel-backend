@@ -655,7 +655,13 @@ async function sweepLineItemImages() {
 // Looks up image + product link for each variant ID via Shopify GraphQL.
 // Returns { [variantId]: { imageUrl, productUrl } }, or null if the lookup
 // failed (e.g. missing read_products scope) so callers can keep old data.
+// If Shopify refuses for lack of the read_products scope, lookups are switched
+// off until the next restart and this is logged once (instead of on every
+// checkouts/update). Callers then keep the pixel's cart HTML.
+let variantLookupDisabled = false;
+
 async function fetchVariantDetails(variantIds) {
+  if (variantLookupDisabled) return null;
   const ids = [...new Set(variantIds.filter(Boolean).map(id => `gid://shopify/ProductVariant/${id}`))];
   if (!ids.length) return {};
   const shop = process.env.SHOPIFY_SHOP_DOMAIN || "medical-and-lab-supplies.myshopify.com";
@@ -679,6 +685,12 @@ async function fetchVariantDetails(variantIds) {
       { headers: { "X-Shopify-Access-Token": SHOPIFY_ACCESS_TOKEN, "Content-Type": "application/json" } }
     );
     if (res.data.errors) {
+      if (res.data.errors.some(e => e.extensions?.code === "ACCESS_DENIED")) {
+        variantLookupDisabled = true;
+        console.warn("[checkout/update] Product image lookup turned off: the Shopify token lacks the read_products scope. " +
+                     "Cart HTML from the pixel is kept as-is (harmless). Add read_products to re-enable — this message shows once per restart.");
+        return null;
+      }
       console.error("[checkout/update] Variant lookup error:", JSON.stringify(res.data.errors));
       return null;
     }
