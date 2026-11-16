@@ -2,6 +2,29 @@
 
 ---
 
+## [2026-11-17, later] Fill missing product images on native cart line items
+
+**File changed:** `index.js`
+
+### Problem
+The abandoned-cart email shows each item's image from the line items that HubSpot's native Shopify integration syncs onto the Cart object (`hs_images`). The sync sometimes leaves `hs_images`, and usually `hs_url`, empty. On 2026-11-09 this happened to 62 items between about 19:45 and 21:00 UTC, all for normal products that have images on every other line item. Brand-new products with no image anywhere also come through empty. Those emails then show no product picture.
+
+### Fix: `sweepLineItemImages()`, every 5 minutes (first run 3 minutes after start)
+- Finds line items created in the last 48 hours (`LINE_ITEM_IMAGE_LOOKBACK_HOURS`) that have a SKU but no `hs_images`, newest first, up to 100 per run.
+- Copies `hs_images` from the newest other line item with the same `hs_sku`, and `hs_url` too if the item has none (an existing link is never overwritten). Lookups are cached per SKU for 6 hours.
+- No image anywhere: uses `FALLBACK_PRODUCT_IMAGE_URL` if that env var is set (for example the Med Lab logo). Otherwise the item is left as is and not retried until the next restart.
+- Writes with `line_items/batch/update`.
+- Only touches line items; the app still never creates or edits Cart objects.
+
+### Requirements
+- HubSpot private-app scopes `crm.objects.line_items.read` and `crm.objects.line_items.write` (added 2026-11-17). A 403 logs which scopes are missing.
+- Optional env var `FALLBACK_PRODUCT_IMAGE_URL`. The Shopify API doesn't expose the store logo, so it has to be set by hand.
+
+### Also: quieter `checkouts/update` image lookup
+`fetchVariantDetails()` logged "Variant lookup error … read_products" on every checkout update, because the Shopify token lacks the `read_products` scope. The first `ACCESS_DENIED` now turns the lookup off until the next restart and logs one warning. Behavior is unchanged: the pixel's cart HTML is kept, and values, shipping and tax are still written.
+
+---
+
 ## [2026-11-17] Guest vs Customer flag for abandoned-cart emails
 
 **Files changed:** `index.js`, `scripts/backfill-customer-type.js` (new), `.gitignore`
