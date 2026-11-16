@@ -2,3 +2,4 @@
 node_modules
 # Cleanup script reports (contain customer emails)
 abandoned-cleanup-*.csv
+customer-type-*.csv
