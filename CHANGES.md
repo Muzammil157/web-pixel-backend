@@ -2,6 +2,43 @@
 
 ---
 
+## [2026-11-17] Guest vs Customer flag for abandoned-cart emails
+
+**Files changed:** `index.js`, `scripts/backfill-customer-type.js` (new), `.gitignore`
+
+### Why
+The abandoned-cart emails need to tell guests apart from existing customers.
+
+### Rule
+- **Customer**: the email has a Shopify store account (customer `state` = `ENABLED`) **or** is subscribed to email marketing in Shopify (`defaultEmailAddress.marketingState` = `SUBSCRIBED`).
+- **Guest**: neither, including emails Shopify has never seen.
+
+Note: a brand-new shopper who ticks "email me with news and offers" at checkout is `SUBSCRIBED`, so counts as Customer under this rule. That's why the two underlying facts are stored too.
+
+### New contact properties (created at startup by `ensureAttributionProperties()`)
+- `shopify_customer_type`: dropdown, Customer / Guest
+- `shopify_has_account`: checkbox, true / false
+- `shopify_email_marketing`: Shopify's raw status (SUBSCRIBED, NOT_SUBSCRIBED, UNSUBSCRIBED, …)
+
+`ensureAttributionProperties()` now also passes dropdown `options` when creating a property.
+
+### When it's set
+- `classifyShopifyCustomer(email)` looks the email up via Admin GraphQL (`customers(query: "email:…")`); `updateShopifyCustomerType(contactId, email)` writes the three properties and never throws.
+- Every abandoned-checkout flag: `flagAbandonedCheckout()` is now a wrapper that runs the original logic (`flagAbandonedCheckoutInner`) and then refreshes the type. This covers both the pixel and the `checkouts/update` webhook.
+- Every order (`reconcileOrderContact`), because a buyer may create an account or opt in at checkout.
+- `sweepCustomerTypes()` runs every 5 minutes (`CUSTOMER_TYPE_SWEEP_MS`; first run 2 minutes after start). It fills contacts created in the last 7 days that have no type yet, up to 100 per run, whoever created them. This mainly covers contacts created by HubSpot's native Shopify app, which creates many abandoners our app never sees.
+- If the Shopify lookup fails, nothing is written, and the sweep retries later.
+
+### Backfill: `scripts/backfill-customer-type.js`
+- Covers contacts without a type that were created in the last 90 days (`--days N` to change) or are currently flagged `shopify_is_abandoned = true`.
+- Dry run by default, writing a CSV report; `--apply` updates HubSpot in batches of 100.
+- Deploy the backend first so the properties exist. Reports are git-ignored because they contain emails.
+
+### Workflow note
+For a contact created by the native app, the sweep can take up to ~5 minutes to set the type. An abandoned-cart workflow should wait at least that long (most already wait an hour) before branching on **Shopify Customer Type**. Treat "unknown" as Guest.
+
+---
+
 ## [2026-10-26] Abandoned-cart fixes from Courtney's review: re-enrollment date, cart value, checkouts/update, cleanup
 
 **Files changed:** `index.js`, `scripts/clear-abandoned-buyers.js` (new), `SETUP_GUIDE.md`, `.gitignore`, and the web pixel (`shopify-pixel/web-pixel/extensions/web-pixel-extension/src/index.js`)

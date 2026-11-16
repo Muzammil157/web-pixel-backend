@@ -444,6 +444,214 @@ async function handleCheckoutUpdate(checkout) {
   }
 }
 
+// ── Guest vs Customer (2026-11-17) ─────────────────────────────────────────
+// Lets the abandoned-cart emails tell guests from existing customers.
+//   Customer = the email has a Shopify store account (state ENABLED)
+//              OR is subscribed to email marketing in Shopify
+//   Guest    = neither (including emails Shopify has never seen)
+// Written to shopify_customer_type, plus the two underlying facts
+// (shopify_has_account, shopify_email_marketing) so the rule can be changed
+// in HubSpot without a code change.
+//
+// Set on: every abandoned-checkout flag (pixel + checkouts/update), every
+// order, and by sweepCustomerTypes() for contacts created by anything else —
+// mainly HubSpot's native Shopify app, which creates many abandoners.
+const CUSTOMER_TYPE_SWEEP_MS       = Number(process.env.CUSTOMER_TYPE_SWEEP_MS) || 5 * 60 * 1000;
+const CUSTOMER_TYPE_SWEEP_LOOKBACK = 7 * 24 * 60 * 60 * 1000; // only contacts created in the last 7 days
+const CUSTOMER_TYPE_SWEEP_BATCH    = 100;
+
+// Returns { type: "customer"|"guest", hasAccount, marketingState } or null if
+// the Shopify lookup failed (callers then leave HubSpot untouched).
+async function classifyShopifyCustomer(email) {
+  const cleanEmail = String(email || "").trim().toLowerCase();
+  if (!cleanEmail || !SHOPIFY_ACCESS_TOKEN) return null;
+  const shop = process.env.SHOPIFY_SHOP_DOMAIN || "medical-and-lab-supplies.myshopify.com";
+  try {
+    const res = await axios.post(
+      `https://${shop}/admin/api/2026-01/graphql.json`,
+      {
+        query: `
+          query CustomerType($q: String!) {
+            customers(first: 1, query: $q) {
+              nodes { state defaultEmailAddress { marketingState } }
+            }
+          }
+        `,
+        variables: { q: `email:"${cleanEmail.replace(/"/g, "")}"` },
+      },
+      { headers: { "X-Shopify-Access-Token": SHOPIFY_ACCESS_TOKEN, "Content-Type": "application/json" } }
+    );
+    if (res.data.errors) {
+      console.error(`[CustomerType] Shopify GraphQL error for ${cleanEmail}:`, JSON.stringify(res.data.errors));
+      return null;
+    }
+    const customer = res.data.data?.customers?.nodes?.[0];
+    const hasAccount     = customer?.state === "ENABLED";
+    const marketingState = customer?.defaultEmailAddress?.marketingState || "NOT_SUBSCRIBED";
+    const subscribed     = marketingState === "SUBSCRIBED";
+    return { type: hasAccount || subscribed ? "customer" : "guest", hasAccount, marketingState };
+  } catch (err) {
+    console.error(`[CustomerType] Shopify lookup failed for ${cleanEmail}:`, err.response?.status || err.message);
+    return null;
+  }
+}
+
+// Looks the email up in Shopify and writes the three properties. Never throws.
+async function updateShopifyCustomerType(contactId, email) {
+  if (!HUBSPOT_ACCESS_TOKEN || !contactId || !email) return null;
+  const result = await classifyShopifyCustomer(email);
+  if (!result) return null;
+  try {
+    await patchHubSpotContact(contactId, {
+      shopify_customer_type:   result.type,
+      shopify_has_account:     result.hasAccount ? "true" : "false",
+      shopify_email_marketing: result.marketingState,
+    }, { Authorization: `Bearer ${HUBSPOT_ACCESS_TOKEN}`, "Content-Type": "application/json" });
+    console.log(`[CustomerType] Contact ${contactId} (${email}) → ${result.type} | account: ${result.hasAccount} | marketing: ${result.marketingState}`);
+  } catch (err) {
+    console.error(`[CustomerType] Could not update contact ${contactId}:`, err.response?.data?.message || err.message);
+  }
+  return result;
+}
+
+// Fills shopify_customer_type on recently created contacts that don't have it
+// yet, whoever created them. Runs every 5 minutes (CUSTOMER_TYPE_SWEEP_MS).
+let customerTypeSweepRunning = false;
+async function sweepCustomerTypes() {
+  if (customerTypeSweepRunning || !HUBSPOT_ACCESS_TOKEN) return;
+  customerTypeSweepRunning = true;
+  try {
+    const res = await axios.post(
+      "https://api.hubapi.com/crm/v3/objects/contacts/search",
+      {
+        filterGroups: [{ filters: [
+          { propertyName: "shopify_customer_type", operator: "NOT_HAS_PROPERTY" },
+          { propertyName: "email",                 operator: "HAS_PROPERTY" },
+          { propertyName: "createdate",            operator: "GTE", value: String(Date.now() - CUSTOMER_TYPE_SWEEP_LOOKBACK) },
+        ] }],
+        properties: ["email"],
+        sorts: [{ propertyName: "createdate", direction: "DESCENDING" }],
+        limit: CUSTOMER_TYPE_SWEEP_BATCH,
+      },
+      { headers: { Authorization: `Bearer ${HUBSPOT_ACCESS_TOKEN}`, "Content-Type": "application/json" } }
+    );
+    const contacts = res.data.results || [];
+    if (contacts.length) console.log(`[CustomerType] Sweep: ${contacts.length} contact(s) without a customer type`);
+    for (const contact of contacts) {
+      await updateShopifyCustomerType(contact.id, contact.properties?.email);
+      await new Promise(resolve => setTimeout(resolve, 250)); // stay well under API limits
+    }
+  } catch (err) {
+    console.error("[CustomerType] Sweep failed:", err.response?.data?.message || err.message);
+  } finally {
+    customerTypeSweepRunning = false;
+  }
+}
+
+// ── Fill missing product images on cart line items (2026-11-17) ───────────
+// HubSpot's native Shopify integration syncs abandoned carts with their line
+// items, and the abandoned-cart email shows each item's image (hs_images).
+// Occasionally the sync leaves hs_images (and hs_url) empty — e.g. 62 items on
+// 2026-11-09 between ~19:45 and 21:00 UTC — so those emails show no picture.
+//
+// Every 5 minutes this finds recently created line items without an image and
+// copies the image (and product link, if missing) from another line item with
+// the same SKU, which almost always exists. If none exists (a brand-new
+// product with no image anywhere), it uses FALLBACK_PRODUCT_IMAGE_URL when
+// that env var is set, otherwise leaves the item alone.
+//
+// Needs the HubSpot private-app scopes crm.objects.line_items.read and
+// crm.objects.line_items.write.
+const LINE_ITEM_IMAGE_SWEEP_MS = Number(process.env.LINE_ITEM_IMAGE_SWEEP_MS) || 5 * 60 * 1000;
+const LINE_ITEM_IMAGE_LOOKBACK = (Number(process.env.LINE_ITEM_IMAGE_LOOKBACK_HOURS) || 48) * 60 * 60 * 1000;
+const FALLBACK_PRODUCT_IMAGE_URL = (process.env.FALLBACK_PRODUCT_IMAGE_URL || "").trim();
+const skuImageCache    = new Map(); // sku → { image, url, at }  (null image = known to have none)
+const SKU_CACHE_TTL    = 6 * 60 * 60 * 1000;
+const lineItemsGivenUp = new Set(); // line items with no image source — not retried every sweep
+
+async function findImageForSku(sku, hsHeaders) {
+  const cached = skuImageCache.get(sku);
+  if (cached && Date.now() - cached.at < SKU_CACHE_TTL) return cached;
+  const res = await axios.post(
+    "https://api.hubapi.com/crm/v3/objects/line_items/search",
+    {
+      filterGroups: [{ filters: [
+        { propertyName: "hs_sku",    operator: "EQ", value: sku },
+        { propertyName: "hs_images", operator: "HAS_PROPERTY" },
+      ] }],
+      properties: ["hs_images", "hs_url"],
+      sorts: [{ propertyName: "createdate", direction: "DESCENDING" }], // newest image wins
+      limit: 1,
+    },
+    { headers: hsHeaders }
+  );
+  const match = res.data.results?.[0]?.properties;
+  const entry = { image: match?.hs_images || null, url: match?.hs_url || null, at: Date.now() };
+  skuImageCache.set(sku, entry);
+  return entry;
+}
+
+let lineItemImageSweepRunning = false;
+async function sweepLineItemImages() {
+  if (lineItemImageSweepRunning || !HUBSPOT_ACCESS_TOKEN) return;
+  lineItemImageSweepRunning = true;
+  const hsHeaders = { Authorization: `Bearer ${HUBSPOT_ACCESS_TOKEN}`, "Content-Type": "application/json" };
+  try {
+    const res = await axios.post(
+      "https://api.hubapi.com/crm/v3/objects/line_items/search",
+      {
+        filterGroups: [{ filters: [
+          { propertyName: "hs_images",  operator: "NOT_HAS_PROPERTY" },
+          { propertyName: "hs_sku",     operator: "HAS_PROPERTY" },
+          { propertyName: "createdate", operator: "GTE", value: String(Date.now() - LINE_ITEM_IMAGE_LOOKBACK) },
+        ] }],
+        properties: ["name", "hs_sku", "hs_url"],
+        sorts: [{ propertyName: "createdate", direction: "DESCENDING" }],
+        limit: 100,
+      },
+      { headers: hsHeaders }
+    );
+    const items = (res.data.results || []).filter(item => !lineItemsGivenUp.has(item.id));
+    if (!items.length) return;
+
+    const updates = [];
+    for (const item of items) {
+      const sku = item.properties?.hs_sku;
+      const source = await findImageForSku(sku, hsHeaders);
+      await new Promise(resolve => setTimeout(resolve, 250)); // HubSpot search ≈ 4 req/s
+      const image = source.image || FALLBACK_PRODUCT_IMAGE_URL;
+      if (!image) {
+        lineItemsGivenUp.add(item.id);
+        console.log(`[LineItemImages] No image found for SKU ${sku} ("${item.properties?.name}") and no FALLBACK_PRODUCT_IMAGE_URL — left as is`);
+        continue;
+      }
+      const properties = { hs_images: image };
+      if (!item.properties?.hs_url && source.url) properties.hs_url = source.url;
+      updates.push({ id: item.id, properties });
+      console.log(`[LineItemImages] Line item ${item.id} (SKU ${sku}) ← ${source.image ? "image from same SKU" : "fallback image"}`);
+    }
+
+    for (let i = 0; i < updates.length; i += 100) {
+      await axios.post(
+        "https://api.hubapi.com/crm/v3/objects/line_items/batch/update",
+        { inputs: updates.slice(i, i + 100) },
+        { headers: hsHeaders }
+      );
+    }
+    if (updates.length) console.log(`[LineItemImages] Filled ${updates.length} line item image(s)`);
+    if (lineItemsGivenUp.size > 5000) lineItemsGivenUp.clear(); // bound memory
+  } catch (err) {
+    const status = err.response?.status;
+    if (status === 403) {
+      console.error("[LineItemImages] HubSpot refused (403) — add the crm.objects.line_items.read and crm.objects.line_items.write scopes to the private app");
+    } else {
+      console.error("[LineItemImages] Sweep failed:", err.response?.data?.message || err.message);
+    }
+  } finally {
+    lineItemImageSweepRunning = false;
+  }
+}
+
 // Looks up image + product link for each variant ID via Shopify GraphQL.
 // Returns { [variantId]: { imageUrl, productUrl } }, or null if the lookup
 // failed (e.g. missing read_products scope) so callers can keep old data.
@@ -907,7 +1115,17 @@ function isCheckoutCompleted(token) {
 // cartHTML === null means "no cart HTML available, keep what's there".
 // Returns { contactId, action } where action is created | flagged |
 // refreshed | skipped-customer | not-found.
-async function flagAbandonedCheckout({ email, firstName = "", lastName = "", token = "",
+// After flagging, the contact's Guest/Customer type is refreshed from Shopify
+// (see updateShopifyCustomerType) — never blocks or fails the flagging itself.
+async function flagAbandonedCheckout(args) {
+  const result = await flagAbandonedCheckoutInner(args);
+  if (result.contactId) {
+    await updateShopifyCustomerType(result.contactId, args.email);
+  }
+  return result;
+}
+
+async function flagAbandonedCheckoutInner({ email, firstName = "", lastName = "", token = "",
                                        cartHTML = null, amounts = {}, checkoutUrl = "",
                                        createIfMissing = true }) {
   const hsHeaders = {
@@ -1336,6 +1554,11 @@ async function reconcileOrderContact(order, customerEmailFallback = "", customer
     }
   }
 
+  // Refresh Guest/Customer — the buyer may have created an account or opted in at checkout
+  if (contactId && resolvedEmail) {
+    await updateShopifyCustomerType(contactId, resolvedEmail);
+  }
+
   // Update reconciliation map — order is always the final truth
   if (resolvedEmail) {
     reconciliationMap.set(resolvedEmail, {
@@ -1418,6 +1641,24 @@ const SHOPIFY_ABANDONED_PROPERTIES = [
   { name: "shopify_abandoned_item_count", label: "Shopify Abandoned Cart Item Count",   type: "number",   fieldType: "number" },
 ];
 
+// Guest vs Customer properties (2026-11-17) — see classifyShopifyCustomer().
+const SHOPIFY_CUSTOMER_TYPE_PROPERTIES = [
+  { name: "shopify_customer_type", label: "Shopify Customer Type", type: "enumeration", fieldType: "select",
+    description: "Customer = has a Shopify store account or is subscribed to email marketing in Shopify. Guest = neither. Set by the Shopify-HubSpot backend.",
+    options: [
+      { label: "Customer", value: "customer", displayOrder: 0 },
+      { label: "Guest",    value: "guest",    displayOrder: 1 },
+    ] },
+  { name: "shopify_has_account", label: "Shopify Has Store Account", type: "enumeration", fieldType: "booleancheckbox",
+    description: "Whether this email has an active Shopify store account (can log in). Set by the Shopify-HubSpot backend.",
+    options: [
+      { label: "Yes", value: "true",  displayOrder: 0 },
+      { label: "No",  value: "false", displayOrder: 1 },
+    ] },
+  { name: "shopify_email_marketing", label: "Shopify Email Marketing Status", type: "string", fieldType: "text",
+    description: "Shopify's email marketing status for this email: SUBSCRIBED, NOT_SUBSCRIBED, UNSUBSCRIBED, PENDING, … Set by the Shopify-HubSpot backend." },
+];
+
 // Creates any missing attribution properties at startup.
 // Needs the crm.schemas.contacts.write scope on the HubSpot private app;
 // without it, the properties must be created by hand in HubSpot.
@@ -1428,6 +1669,7 @@ async function ensureAttributionProperties() {
   const allProps = [
     ...SHOPIFY_ATTRIBUTION_PROPERTIES,
     ...SHOPIFY_ABANDONED_PROPERTIES.map(p => ({ ...p, description: p.description || ABANDONED_DESCRIPTION })),
+    ...SHOPIFY_CUSTOMER_TYPE_PROPERTIES,
   ];
   for (const prop of allProps) {
     try {
@@ -1438,7 +1680,7 @@ async function ensureAttributionProperties() {
     }
   }
   if (missing.length === 0) {
-    console.log(`[Attribution] All ${allProps.length} Shopify attribution + abandoned-checkout properties exist in HubSpot`);
+    console.log(`[Attribution] All ${allProps.length} Shopify attribution, abandoned-checkout and customer-type properties exist in HubSpot`);
     return;
   }
   for (const prop of missing) {
@@ -1452,6 +1694,7 @@ async function ensureAttributionProperties() {
           fieldType: prop.fieldType,
           groupName: "contactinformation",
           description: prop.description || "Set by the Shopify-HubSpot backend from Shopify's order customer journey.",
+          ...(prop.options ? { options: prop.options } : {}),
         },
         { headers: hsHeaders }
       );
@@ -1620,6 +1863,15 @@ ensureAttributionProperties().catch(err =>
 // so orders queued before a restart are picked up promptly.
 setTimeout(sweepAttributionQueue, 60 * 1000);
 setInterval(sweepAttributionQueue, ATTRIBUTION_SWEEP_MS);
+
+// Fill Guest/Customer on new contacts (incl. ones created by the native
+// Shopify app). First run 2 minutes after start, after properties exist.
+setTimeout(sweepCustomerTypes, 2 * 60 * 1000);
+setInterval(sweepCustomerTypes, CUSTOMER_TYPE_SWEEP_MS);
+
+// Fill missing product images on synced cart line items. First run 3 minutes after start.
+setTimeout(sweepLineItemImages, 3 * 60 * 1000);
+setInterval(sweepLineItemImages, LINE_ITEM_IMAGE_SWEEP_MS);
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
